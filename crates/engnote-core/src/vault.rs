@@ -51,21 +51,39 @@ pub fn list(vault_dir: &Path) -> Result<Vec<(PathBuf, Note)>> {
     Ok(notes)
 }
 
-/// Resolves a note by ULID suffix match against `frontmatter.id`. Suffix (not
-/// prefix) because a ULID's leading characters encode the timestamp, so notes
-/// created close together share a prefix; the trailing characters are random.
+/// Resolves a note by ULID suffix match against `frontmatter.id` (suffix, not
+/// prefix, because a ULID's leading characters encode the timestamp, so notes
+/// created close together share a prefix; the trailing characters are random).
+/// Falls back to a case-insensitive title substring match when no id matches.
 pub fn find_by_ref(vault_dir: &Path, note_ref: &str) -> Result<(PathBuf, Note)> {
-    let mut matches: Vec<(PathBuf, Note)> = list(vault_dir)?
-        .into_iter()
-        .filter(|(_, note)| note.frontmatter.id.ends_with(note_ref))
+    let mut notes = list(vault_dir)?;
+
+    let mut candidates: Vec<usize> = notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, note))| note.frontmatter.id.ends_with(note_ref))
+        .map(|(i, _)| i)
         .collect();
 
-    match matches.len() {
+    if candidates.is_empty() {
+        let query = note_ref.to_lowercase();
+        candidates = notes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, note))| note.frontmatter.title.to_lowercase().contains(&query))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
+    match candidates.len() {
         0 => bail!("no note matches ref '{note_ref}'"),
-        1 => Ok(matches.remove(0)),
+        1 => Ok(notes.remove(candidates[0])),
         _ => {
-            let ids: Vec<_> = matches.iter().map(|(_, n)| n.frontmatter.id.clone()).collect();
-            bail!("ref '{note_ref}' is ambiguous, matches: {}", ids.join(", "))
+            let labels: Vec<_> = candidates
+                .iter()
+                .map(|&i| format!("{} ({})", notes[i].1.frontmatter.id, notes[i].1.frontmatter.title))
+                .collect();
+            bail!("ref '{note_ref}' is ambiguous, matches: {}", labels.join(", "))
         }
     }
 }
