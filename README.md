@@ -22,6 +22,27 @@ echo 'source <(COMPLETE=zsh engnote)' >> ~/.zshrc
 
 `engnote`をアップグレードしたら`exec zsh`などでシェルを再起動すること(補完スクリプトは`engnote`本体から都度生成される)。
 
+## GUI(macOS)
+
+`crates/engnote-gui` はegui/eframeによるネイティブGUI。Dockアイコンから起動できる`.app`として使うには:
+
+```bash
+cargo install cargo-bundle  # 初回のみ
+cd crates/engnote-gui
+cargo bundle --release
+rm -rf /Applications/engnote.app
+cp -R ../../target/release/bundle/osx/engnote.app /Applications/
+codesign --force --deep --sign - /Applications/engnote.app
+```
+
+最後の`codesign`は必須。`cargo bundle`が作るバンドルはバイナリ単体は署名済みだがバンドル全体(`Info.plist`・アイコン)には署名が及んでおらず、これが無いとDockが起動中のアイコンをうまく解決できず、実行ファイル名の頭文字だけの汎用アイコンにフォールバックしてしまう。
+
+`/Applications/engnote.app` をDockにドラッグすれば、アイコンクリックで起動できる。コード変更後は同じ手順で入れ直す。
+
+アイコンは `crates/engnote-gui/icons/icon-1024.png` が元データ。変更した場合は `crates/engnote-gui/icons/generate-icns.sh` で `AppIcon.icns` を再生成する(macOS標準の`sips`/`iconutil`を使用)。
+
+インストールせず動かす場合は `cargo run -p engnote-gui`。
+
 ## 設定
 
 - `ENGNOTE_VAULT_DIR`: ノートの保存先。未設定なら`~/.engnote/vault`
@@ -59,6 +80,5 @@ engnote rm [<ref>]              # 確認あり
 - `search`(全文検索)
 - `sync`(SQLiteインデックス再構築、エディタでの直接編集/git pull後の整合性チェック)
 - `[[note]]`リンクの解決
-- GUI
 
 詳しい仕様は `.claude/rules/` を参照。
