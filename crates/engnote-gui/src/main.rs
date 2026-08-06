@@ -1,4 +1,5 @@
 mod theme;
+mod vim;
 
 use std::path::PathBuf;
 
@@ -6,6 +7,18 @@ use chrono::Local;
 use eframe::egui;
 use engnote_core::note::{Note, Status};
 use engnote_core::vault;
+
+/// Id of the sidebar filter `TextEdit`, so global key handling can tell
+/// whether it currently has focus (and can request/surrender that focus).
+const FILTER_ID: &str = "engnote-filter";
+/// Id of the body `TextEdit` shown in vim Insert mode; used to read back its
+/// live cursor position when leaving Insert mode (see `EditForm::cursor`).
+const EDIT_BODY_ID: &str = "engnote-edit-body";
+/// Same idea as `EDIT_BODY_ID`, for the title and tags fields.
+const TITLE_FIELD_ID: &str = "engnote-edit-title";
+const TAGS_FIELD_ID: &str = "engnote-edit-tags";
+/// Id of the `:command` line's `TextEdit` in the bottom status bar.
+const COMMAND_ID: &str = "engnote-command";
 
 fn main() -> eframe::Result<()> {
     let vault_dir = vault::resolve_vault_dir().expect("resolving vault dir");
@@ -113,6 +126,24 @@ enum Mode {
     Editing(EditForm),
 }
 
+/// Which field of the edit form vim motions currently apply to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ActiveField {
+    Title,
+    Tags,
+    Body,
+}
+
+impl ActiveField {
+    fn id(self) -> egui::Id {
+        egui::Id::new(match self {
+            ActiveField::Title => TITLE_FIELD_ID,
+            ActiveField::Tags => TAGS_FIELD_ID,
+            ActiveField::Body => EDIT_BODY_ID,
+        })
+    }
+}
+
 struct EditForm {
     /// `None` for a brand-new note, `Some(path)` when editing an existing one.
     path: Option<PathBuf>,
@@ -122,6 +153,20 @@ struct EditForm {
     tags: String,
     body: String,
     status: Status,
+    /// Which field (`title`/`tags`/`body`) vim motions currently target.
+    active_field: ActiveField,
+    /// vim-style Normal/Insert mode for the active field (see `vim.rs`).
+    editor_mode: vim::EditorMode,
+    /// Cursor position within the active field, as a *character* (not byte)
+    /// index. Authoritative in Normal mode; synced from the live `TextEdit`
+    /// on entering/leaving Insert mode (see `App::handle_editing_keys`).
+    cursor: usize,
+    /// Set for exactly one frame after switching to Insert mode, so the
+    /// active field's `TextEdit` picks up `cursor`/focus once without
+    /// fighting the user's subsequent typing every frame after.
+    just_entered_insert: bool,
+    pending_g: bool,
+    pending_d: bool,
 }
 
 impl EditForm {
@@ -135,6 +180,13 @@ impl EditForm {
             tags: String::new(),
             body: String::new(),
             status: Status::Draft,
+            // A brand-new note has nothing to edit yet, so start at the top.
+            active_field: ActiveField::Title,
+            editor_mode: vim::EditorMode::Normal,
+            cursor: 0,
+            just_entered_insert: false,
+            pending_g: false,
+            pending_d: false,
         }
     }
 
@@ -147,7 +199,55 @@ impl EditForm {
             tags: note.frontmatter.tags.join(", "),
             body: note.body.clone(),
             status: note.frontmatter.status,
+            // Editing an existing note: jump straight to its content.
+            active_field: ActiveField::Body,
+            editor_mode: vim::EditorMode::Normal,
+            cursor: 0,
+            just_entered_insert: false,
+            pending_g: false,
+            pending_d: false,
         }
+    }
+
+    fn active_field_len(&self) -> usize {
+        match self.active_field {
+            ActiveField::Title => self.title.chars().count(),
+            ActiveField::Tags => self.tags.chars().count(),
+            ActiveField::Body => self.body.chars().count(),
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        self.cursor = self.cursor.min(self.active_field_len());
+    }
+
+    /// Full wrap-around cycle (Title -> Tags -> Body -> Title), used by `Tab`.
+    fn cycle_field(&mut self, forward: bool) {
+        use ActiveField::*;
+        self.active_field = match (self.active_field, forward) {
+            (Title, true) => Tags,
+            (Tags, true) => Body,
+            (Body, true) => Title,
+            (Title, false) => Body,
+            (Tags, false) => Title,
+            (Body, false) => Tags,
+        };
+        self.clamp_cursor();
+    }
+
+    /// `j`/`k` between Title/Tags only (Body has real vertical motion, and
+    /// isn't reachable "downward" from here — `Tab` reaches it explicitly).
+    /// Clamps at Title rather than wrapping, since real vim doesn't wrap at
+    /// the top of a buffer either.
+    fn step_field(&mut self, forward: bool) {
+        use ActiveField::*;
+        self.active_field = match (self.active_field, forward) {
+            (Title, true) => Tags,
+            (Tags, true) => Body,
+            (Tags, false) => Title,
+            (other, _) => other,
+        };
+        self.clamp_cursor();
     }
 
     fn into_note(self, context_path: Option<String>) -> Note {
@@ -181,6 +281,8 @@ struct App {
     mode: Mode,
     error: Option<String>,
     dock_icon_set: bool,
+    /// `Some(buffer)` while the `:command` line (opened with `:`) is active.
+    command_input: Option<String>,
 }
 
 impl App {
@@ -193,6 +295,7 @@ impl App {
             mode: Mode::Viewing,
             error: None,
             dock_icon_set: false,
+            command_input: None,
         };
         app.reload();
         app
@@ -235,6 +338,215 @@ impl App {
             Err(e) => self.error = Some(format!("保存に失敗: {e:#}")),
         }
     }
+
+    /// Moves `self.selected` up/down by one within the currently filtered
+    /// note list (`j`/`k`).
+    fn select_relative(&mut self, delta: i32) {
+        let filter = self.filter.to_lowercase();
+        let visible: Vec<usize> = self
+            .notes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, n))| {
+                filter.is_empty()
+                    || n.frontmatter.title.to_lowercase().contains(&filter)
+                    || n.frontmatter.tags.iter().any(|t| t.to_lowercase().contains(&filter))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if visible.is_empty() {
+            return;
+        }
+        let current = self.selected.and_then(|s| visible.iter().position(|&i| i == s));
+        let next = match current {
+            Some(p) => (p as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        self.selected = Some(visible[next]);
+    }
+
+    /// App-wide vim-style keyboard shortcuts. Skipped whenever some other
+    /// widget (a plain text field) currently wants the keyboard, so normal
+    /// typing in the title/tags/filter fields is unaffected.
+    fn handle_global_keys(&mut self, ctx: &egui::Context) {
+        let filter_id = egui::Id::new(FILTER_ID);
+        if ctx.memory(|m| m.focused()) == Some(filter_id) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                ctx.memory_mut(|m| m.surrender_focus(filter_id));
+            }
+            return;
+        }
+
+        if self.command_input.is_some() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.command_input = None;
+            } else if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                let cmd = self.command_input.take().unwrap_or_default();
+                self.execute_command(&cmd);
+            }
+            return;
+        }
+
+        if !ctx.wants_keyboard_input() && consume_text_event(ctx, ':') {
+            self.command_input = Some(String::new());
+            return;
+        }
+
+        if matches!(self.mode, Mode::Editing(_)) {
+            self.handle_editing_keys(ctx);
+        } else {
+            self.handle_viewing_keys(ctx, filter_id);
+        }
+    }
+
+    /// Executes a vim-style `:command` (see the bottom command line).
+    fn execute_command(&mut self, cmd: &str) {
+        match cmd.trim() {
+            "e" | "new" | "enew" => {
+                self.mode = Mode::Editing(EditForm::blank());
+                self.selected = None;
+            }
+            "w" | "wq" | "x" => {
+                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
+                    self.save_edit(form);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_viewing_keys(&mut self, ctx: &egui::Context, filter_id: egui::Id) {
+        if ctx.wants_keyboard_input() {
+            return;
+        }
+        for ch in collect_text_chars(ctx) {
+            match ch {
+                'j' => self.select_relative(1),
+                'k' => self.select_relative(-1),
+                'n' => {
+                    self.mode = Mode::Editing(EditForm::blank());
+                    self.selected = None;
+                    return;
+                }
+                'e' | 'i' => {
+                    if let Some(idx) = self.selected {
+                        let path = self.notes[idx].0.clone();
+                        let note = self.notes[idx].1.clone();
+                        self.mode = Mode::Editing(EditForm::from_note(path, &note));
+                        return;
+                    }
+                }
+                '/' => {
+                    // Consume this event so the `/` doesn't also land as the
+                    // filter's first typed character once it gets focus.
+                    consume_text_event(ctx, '/');
+                    ctx.memory_mut(|m| m.request_focus(filter_id));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn handle_editing_keys(&mut self, ctx: &egui::Context) {
+        enum Intent {
+            None,
+            ExitToViewing,
+            Save,
+        }
+        let mut intent = Intent::None;
+
+        if let Mode::Editing(form) = &mut self.mode {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+                intent = Intent::Save;
+            } else if form.editor_mode == vim::EditorMode::Insert {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    let field_id = form.active_field.id();
+                    if let Some(range) = egui::text_edit::TextEditState::load(ctx, field_id)
+                        .and_then(|state| state.cursor.char_range())
+                    {
+                        form.cursor = range.primary.index;
+                    }
+                    form.editor_mode = vim::EditorMode::Normal;
+                }
+            } else if !ctx.wants_keyboard_input() {
+                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    intent = Intent::ExitToViewing;
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+                    let forward = !ctx.input(|i| i.modifiers.shift);
+                    form.cycle_field(forward);
+                } else {
+                    for ch in collect_text_chars(ctx) {
+                        // On Title/Tags (single-line fields), `j`/`k` step
+                        // between fields instead of the usual vertical
+                        // motion, which would be a no-op there anyway.
+                        if form.active_field != ActiveField::Body && (ch == 'j' || ch == 'k') {
+                            form.step_field(ch == 'j');
+                            continue;
+                        }
+                        let text = match form.active_field {
+                            ActiveField::Title => &mut form.title,
+                            ActiveField::Tags => &mut form.tags,
+                            ActiveField::Body => &mut form.body,
+                        };
+                        vim::handle_normal_key(
+                            text,
+                            &mut form.cursor,
+                            &mut form.pending_g,
+                            &mut form.pending_d,
+                            &mut form.editor_mode,
+                            ch,
+                        );
+                    }
+                    if form.editor_mode == vim::EditorMode::Insert {
+                        form.just_entered_insert = true;
+                        // Don't let the `i`/`a`/`o`/`O` that opened Insert
+                        // mode also get typed into the field's TextEdit once
+                        // it gains focus later this same frame.
+                        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Text(_))));
+                    }
+                }
+            }
+        }
+
+        match intent {
+            Intent::ExitToViewing => self.mode = Mode::Viewing,
+            Intent::Save => {
+                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
+                    self.save_edit(form);
+                }
+            }
+            Intent::None => {}
+        }
+    }
+}
+
+/// Single-character text-input events for this frame (i.e. actual typed
+/// characters post-keyboard-layout, not raw physical keys — this is what
+/// makes `$`/`0`/`g` etc. work the same regardless of keyboard layout).
+fn collect_text_chars(ctx: &egui::Context) -> Vec<char> {
+    ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Text(t) if t.chars().count() == 1 => t.chars().next(),
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// Removes this frame's `target` text-input event, if present, and reports
+/// whether it was there. Used when `target` toggles some *other* widget into
+/// focus (e.g. `/` focuses the filter box), so it doesn't also get typed into
+/// that widget once it has focus later in the same frame.
+fn consume_text_event(ctx: &egui::Context, target: char) -> bool {
+    ctx.input_mut(|i| {
+        let before = i.events.len();
+        i.events
+            .retain(|e| !matches!(e, egui::Event::Text(t) if t.chars().eq(std::iter::once(target))));
+        i.events.len() != before
+    })
 }
 
 enum GuiAction {
@@ -294,6 +606,65 @@ fn note_card(ui: &mut egui::Ui, note: &Note, selected: bool) -> egui::Response {
     response
 }
 
+/// Renders a single-line vim field (title/tags): the live `TextEdit` when
+/// it's active and in Insert mode, a cursor-highlighted read-only view when
+/// active and in Normal mode, or a plain clickable label when inactive.
+/// Returns `true` if the user clicked it while inactive (the caller should
+/// then make it the active field).
+fn vim_line_field(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    is_active: bool,
+    editor_mode: vim::EditorMode,
+    cursor: usize,
+    field_id: egui::Id,
+    just_entered_insert: &mut bool,
+) -> bool {
+    if !is_active {
+        let display = if text.is_empty() {
+            "(空)".to_string()
+        } else {
+            text.clone()
+        };
+        return ui
+            .add(
+                egui::Label::new(egui::RichText::new(display).color(theme::TEXT_DIM))
+                    .selectable(false)
+                    .sense(egui::Sense::click()),
+            )
+            .clicked();
+    }
+
+    match editor_mode {
+        vim::EditorMode::Insert => {
+            let mut output = egui::TextEdit::singleline(text)
+                .id(field_id)
+                .desired_width(f32::INFINITY)
+                .show(ui);
+            if *just_entered_insert {
+                output.state.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(cursor),
+                )));
+                output.state.store(ui.ctx(), field_id);
+                output.response.request_focus();
+                *just_entered_insert = false;
+            }
+        }
+        vim::EditorMode::Normal => {
+            let job = vim::normal_mode_body_job(
+                text,
+                cursor,
+                egui::FontId::proportional(14.5),
+                theme::TEXT,
+                theme::ACCENT,
+                theme::BG,
+            );
+            ui.add(egui::Label::new(job).selectable(false));
+        }
+    }
+    false
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.dock_icon_set {
@@ -304,6 +675,8 @@ impl eframe::App for App {
             set_dock_icon();
             self.dock_icon_set = true;
         }
+
+        self.handle_global_keys(ctx);
 
         let mut action: Option<GuiAction> = None;
 
@@ -318,6 +691,44 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::from_rgb(255, 130, 130), format!("⚠ {err}"));
                 });
         }
+
+        egui::TopBottomPanel::bottom("statusbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL_BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                if let Some(cmd) = &mut self.command_input {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(":").monospace().color(theme::TEXT));
+                        let command_id = egui::Id::new(COMMAND_ID);
+                        let response = ui.add(
+                            egui::TextEdit::singleline(cmd)
+                                .id(command_id)
+                                .frame(false)
+                                .desired_width(f32::INFINITY),
+                        );
+                        if ctx.memory(|m| m.focused()) != Some(command_id) {
+                            response.request_focus();
+                        }
+                    });
+                } else if let Mode::Editing(form) = &self.mode {
+                    let (text, color) = match form.editor_mode {
+                        vim::EditorMode::Normal => ("-- NORMAL --", theme::TEXT_DIM),
+                        vim::EditorMode::Insert => {
+                            ("-- INSERT --", theme::status_color(Status::Active))
+                        }
+                    };
+                    ui.label(egui::RichText::new(text).monospace().strong().color(color));
+                } else {
+                    ui.label(
+                        egui::RichText::new("j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド")
+                            .small()
+                            .color(theme::TEXT_DIM),
+                    );
+                }
+            });
 
         egui::SidePanel::left("notes")
             .resizable(true)
@@ -338,7 +749,8 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("タイトル・タグで絞り込み")
+                        .id(egui::Id::new(FILTER_ID))
+                        .hint_text("タイトル・タグで絞り込み (/)")
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(10.0);
@@ -466,10 +878,18 @@ impl eframe::App for App {
                                         .small()
                                         .color(theme::TEXT_DIM),
                                 );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.title)
-                                        .desired_width(f32::INFINITY),
-                                );
+                                if vim_line_field(
+                                    ui,
+                                    &mut form.title,
+                                    form.active_field == ActiveField::Title,
+                                    form.editor_mode,
+                                    form.cursor,
+                                    egui::Id::new(TITLE_FIELD_ID),
+                                    &mut form.just_entered_insert,
+                                ) {
+                                    form.active_field = ActiveField::Title;
+                                    form.clamp_cursor();
+                                }
                                 ui.add_space(10.0);
 
                                 ui.label(
@@ -477,10 +897,18 @@ impl eframe::App for App {
                                         .small()
                                         .color(theme::TEXT_DIM),
                                 );
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut form.tags)
-                                        .desired_width(f32::INFINITY),
-                                );
+                                if vim_line_field(
+                                    ui,
+                                    &mut form.tags,
+                                    form.active_field == ActiveField::Tags,
+                                    form.editor_mode,
+                                    form.cursor,
+                                    egui::Id::new(TAGS_FIELD_ID),
+                                    &mut form.just_entered_insert,
+                                ) {
+                                    form.active_field = ActiveField::Tags;
+                                    form.clamp_cursor();
+                                }
                                 ui.add_space(10.0);
 
                                 ui.label(
@@ -497,9 +925,7 @@ impl eframe::App for App {
                                     });
                                 ui.add_space(16.0);
 
-                                ui.label(
-                                    egui::RichText::new("本文").small().color(theme::TEXT_DIM),
-                                );
+                                ui.label(egui::RichText::new("本文").small().color(theme::TEXT_DIM));
                                 egui::Frame::new()
                                     .fill(theme::CARD_BG)
                                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -510,12 +936,65 @@ impl eframe::App for App {
                                             .id_salt("edit-body-scroll")
                                             .max_height(360.0)
                                             .show(ui, |ui| {
-                                                ui.add(
-                                                    egui::TextEdit::multiline(&mut form.body)
-                                                        .frame(false)
-                                                        .desired_rows(18)
-                                                        .desired_width(f32::INFINITY),
-                                                );
+                                                if form.active_field != ActiveField::Body {
+                                                    let display = if form.body.is_empty() {
+                                                        "(空)".to_string()
+                                                    } else {
+                                                        form.body.clone()
+                                                    };
+                                                    let clicked = ui
+                                                        .add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new(display)
+                                                                    .color(theme::TEXT_DIM),
+                                                            )
+                                                            .selectable(false)
+                                                            .sense(egui::Sense::click())
+                                                            .wrap_mode(egui::TextWrapMode::Wrap),
+                                                        )
+                                                        .clicked();
+                                                    if clicked {
+                                                        form.active_field = ActiveField::Body;
+                                                        form.clamp_cursor();
+                                                    }
+                                                } else {
+                                                    match form.editor_mode {
+                                                        vim::EditorMode::Insert => {
+                                                            let body_id = egui::Id::new(EDIT_BODY_ID);
+                                                            let mut output = egui::TextEdit::multiline(&mut form.body)
+                                                                .id(body_id)
+                                                                .frame(false)
+                                                                .desired_rows(18)
+                                                                .desired_width(f32::INFINITY)
+                                                                .show(ui);
+                                                            if form.just_entered_insert {
+                                                                output.state.cursor.set_char_range(Some(
+                                                                    egui::text::CCursorRange::one(
+                                                                        egui::text::CCursor::new(form.cursor),
+                                                                    ),
+                                                                ));
+                                                                output.state.store(ui.ctx(), body_id);
+                                                                output.response.request_focus();
+                                                                form.just_entered_insert = false;
+                                                            }
+                                                        }
+                                                        vim::EditorMode::Normal => {
+                                                            let job = vim::normal_mode_body_job(
+                                                                &form.body,
+                                                                form.cursor,
+                                                                egui::FontId::monospace(13.5),
+                                                                theme::TEXT,
+                                                                theme::ACCENT,
+                                                                theme::BG,
+                                                            );
+                                                            ui.add(
+                                                                egui::Label::new(job)
+                                                                    .selectable(false)
+                                                                    .wrap_mode(egui::TextWrapMode::Wrap),
+                                                            );
+                                                        }
+                                                    }
+                                                }
                                             });
                                     });
 
