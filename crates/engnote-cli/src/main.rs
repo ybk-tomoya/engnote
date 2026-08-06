@@ -2,7 +2,8 @@ use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use engnote_core::note::{parse_status, Note};
 use engnote_core::vault;
 
@@ -31,7 +32,7 @@ enum Command {
         /// Attach the note to the current directory (context_path).
         #[arg(long)]
         here: bool,
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::AnyPath)]
         context: Option<String>,
     },
     /// List notes.
@@ -40,7 +41,7 @@ enum Command {
         status: Option<String>,
         #[arg(long = "tag")]
         tag: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_hint = clap::ValueHint::AnyPath)]
         context: Option<String>,
     },
     /// List notes whose context_path covers the current directory.
@@ -48,20 +49,34 @@ enum Command {
         #[arg(long)]
         status: Option<String>,
     },
-    /// Print a note's contents.
-    Show { note_ref: String },
-    /// Open a note in $EDITOR.
-    Edit { note_ref: String },
-    /// Delete a note.
-    Rm { note_ref: String },
-    /// Add or remove a tag.
+    /// Print a note's contents. Omit <ref> to pick interactively.
+    Show {
+        #[arg(add = ArgValueCompleter::new(complete_note_ref))]
+        note_ref: Option<String>,
+    },
+    /// Open a note in $EDITOR. Omit <ref> to pick interactively.
+    Edit {
+        #[arg(add = ArgValueCompleter::new(complete_note_ref))]
+        note_ref: Option<String>,
+    },
+    /// Delete a note. Omit <ref> to pick interactively.
+    Rm {
+        #[arg(add = ArgValueCompleter::new(complete_note_ref))]
+        note_ref: Option<String>,
+    },
+    /// Add or remove a tag. Omit <ref> to pick interactively.
     Tag {
-        note_ref: String,
+        #[arg(add = ArgValueCompleter::new(complete_note_ref))]
+        note_ref: Option<String>,
         #[command(subcommand)]
         action: TagAction,
     },
-    /// Change a note's status.
-    Status { note_ref: String, value: String },
+    /// Change a note's status. `[<ref>] <value>`; omit <ref> to pick interactively.
+    Status {
+        /// `[<ref>] <value>`, e.g. `status active` or `status abc123 active`.
+        #[arg(num_args = 1..=2, add = ArgValueCompleter::new(complete_status_arg))]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -71,6 +86,8 @@ enum TagAction {
 }
 
 fn main() -> Result<()> {
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
     let vault_dir = vault::resolve_vault_dir()?;
 
@@ -84,11 +101,20 @@ fn main() -> Result<()> {
         } => new(&vault_dir, title, tags, here, context),
         Command::List { status, tag, context } => list(&vault_dir, status, tag, context),
         Command::Here { status } => here(&vault_dir, status),
-        Command::Show { note_ref } => show(&vault_dir, &note_ref),
-        Command::Edit { note_ref } => edit(&vault_dir, &note_ref),
-        Command::Rm { note_ref } => rm(&vault_dir, &note_ref),
-        Command::Tag { note_ref, action } => tag(&vault_dir, &note_ref, action),
-        Command::Status { note_ref, value } => status(&vault_dir, &note_ref, &value),
+        Command::Show { note_ref } => show(&vault_dir, note_ref),
+        Command::Edit { note_ref } => edit(&vault_dir, note_ref),
+        Command::Rm { note_ref } => rm(&vault_dir, note_ref),
+        Command::Tag { note_ref, action } => tag(&vault_dir, note_ref, action),
+        Command::Status { args } => {
+            let (note_ref, value) = match args.len() {
+                1 => (None, args.into_iter().next().unwrap()),
+                _ => {
+                    let mut it = args.into_iter();
+                    (Some(it.next().unwrap()), it.next().unwrap())
+                }
+            };
+            status(&vault_dir, note_ref, &value)
+        }
     }
 }
 
@@ -175,24 +201,107 @@ fn here(vault_dir: &std::path::Path, status: Option<String>) -> Result<()> {
 }
 
 fn print_row(note: &Note) {
-    let id = &note.frontmatter.id;
-    let short_id = &id[id.len().saturating_sub(7)..];
     let tags = note.frontmatter.tags.join(",");
     println!(
         "{short_id}  {status:<8}  {title}  [{tags}]",
+        short_id = note.short_id(),
         status = note.frontmatter.status.to_string(),
         title = note.frontmatter.title,
     );
 }
 
-fn show(vault_dir: &std::path::Path, note_ref: &str) -> Result<()> {
-    let (_, note) = vault::find_by_ref(vault_dir, note_ref)?;
+/// Dynamic shell completion for `<ref>` arguments (see `CompleteEnv` wiring in
+/// `main`): matches on short id prefix or a title substring, same fallback as
+/// `vault::find_by_ref`.
+fn complete_note_ref(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let Ok(vault_dir) = vault::resolve_vault_dir() else {
+        return Vec::new();
+    };
+    let Ok(notes) = vault::list(&vault_dir) else {
+        return Vec::new();
+    };
+    let current = current.to_string_lossy();
+    let current_lower = current.to_lowercase();
+
+    notes
+        .iter()
+        .filter(|(_, note)| {
+            current.is_empty()
+                || note.short_id().starts_with(current.as_ref())
+                || note.frontmatter.title.to_lowercase().contains(&current_lower)
+        })
+        .map(|(_, note)| {
+            let help = format!(
+                "{status:<8} {title} [{tags}]",
+                status = note.frontmatter.status,
+                title = note.frontmatter.title,
+                tags = note.frontmatter.tags.join(","),
+            );
+            CompletionCandidate::new(note.short_id()).help(Some(help.into()))
+        })
+        .collect()
+}
+
+/// Completer for `status`'s `[<ref>] <value>` args. clap_complete doesn't
+/// distinguish which of the two slots is being completed for a positional
+/// with `num_args = 1..=2` (`arg_index` is always 0), so this offers note
+/// refs and status literals together regardless of slot.
+fn complete_status_arg(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
+    let mut candidates = complete_note_ref(current);
+    let current_str = current.to_string_lossy();
+    candidates.extend(
+        ["draft", "active", "archived"]
+            .into_iter()
+            .filter(|v| v.starts_with(current_str.as_ref()))
+            .map(CompletionCandidate::new),
+    );
+    candidates
+}
+
+/// Resolves a note by `<ref>`, or, when omitted, lets the user pick one
+/// interactively (fuzzy search over title/status/tags).
+fn resolve_note(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result<(std::path::PathBuf, Note)> {
+    if let Some(note_ref) = note_ref {
+        return vault::find_by_ref(vault_dir, &note_ref);
+    }
+
+    let mut notes = vault::list(vault_dir)?;
+    if notes.is_empty() {
+        bail!("no notes in vault");
+    }
+    let labels: Vec<String> = notes
+        .iter()
+        .map(|(_, note)| {
+            format!(
+                "{short_id}  {status:<8}  {title}  [{tags}]",
+                short_id = note.short_id(),
+                status = note.frontmatter.status,
+                title = note.frontmatter.title,
+                tags = note.frontmatter.tags.join(","),
+            )
+        })
+        .collect();
+
+    let selection = dialoguer::FuzzySelect::new()
+        .with_prompt("select a note")
+        .items(&labels)
+        .interact_opt()
+        .context("running interactive note picker")?;
+
+    match selection {
+        Some(i) => Ok(notes.remove(i)),
+        None => bail!("no note selected"),
+    }
+}
+
+fn show(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result<()> {
+    let (_, note) = resolve_note(vault_dir, note_ref)?;
     print!("{}", note.to_file_contents()?);
     Ok(())
 }
 
-fn edit(vault_dir: &std::path::Path, note_ref: &str) -> Result<()> {
-    let (path, note) = vault::find_by_ref(vault_dir, note_ref)?;
+fn edit(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result<()> {
+    let (path, note) = resolve_note(vault_dir, note_ref)?;
     let edited = edit_in_editor(&note.to_file_contents()?)?;
     let mut note = Note::parse(&edited)?;
     note.frontmatter.updated = Local::now();
@@ -201,8 +310,8 @@ fn edit(vault_dir: &std::path::Path, note_ref: &str) -> Result<()> {
     Ok(())
 }
 
-fn rm(vault_dir: &std::path::Path, note_ref: &str) -> Result<()> {
-    let (path, note) = vault::find_by_ref(vault_dir, note_ref)?;
+fn rm(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result<()> {
+    let (path, note) = resolve_note(vault_dir, note_ref)?;
     print!("delete '{}' ({})? [y/N] ", note.frontmatter.title, note.frontmatter.id);
     std::io::stdout().flush()?;
     let mut answer = String::new();
@@ -216,8 +325,8 @@ fn rm(vault_dir: &std::path::Path, note_ref: &str) -> Result<()> {
     Ok(())
 }
 
-fn tag(vault_dir: &std::path::Path, note_ref: &str, action: TagAction) -> Result<()> {
-    let (path, mut note) = vault::find_by_ref(vault_dir, note_ref)?;
+fn tag(vault_dir: &std::path::Path, note_ref: Option<String>, action: TagAction) -> Result<()> {
+    let (path, mut note) = resolve_note(vault_dir, note_ref)?;
     match action {
         TagAction::Add { tag } => {
             if !note.frontmatter.tags.contains(&tag) {
@@ -232,8 +341,8 @@ fn tag(vault_dir: &std::path::Path, note_ref: &str, action: TagAction) -> Result
     Ok(())
 }
 
-fn status(vault_dir: &std::path::Path, note_ref: &str, value: &str) -> Result<()> {
-    let (path, mut note) = vault::find_by_ref(vault_dir, note_ref)?;
+fn status(vault_dir: &std::path::Path, note_ref: Option<String>, value: &str) -> Result<()> {
+    let (path, mut note) = resolve_note(vault_dir, note_ref)?;
     note.frontmatter.status = parse_status(value)?;
     note.frontmatter.updated = Local::now();
     vault::save_at(&path, &note)?;

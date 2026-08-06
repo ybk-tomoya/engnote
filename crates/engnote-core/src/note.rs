@@ -70,6 +70,13 @@ impl Note {
         }
     }
 
+    /// Trailing 7 characters of the id, used as the short id shown by `list`
+    /// and accepted by `<ref>` (see .claude/rules/cli-spec.md).
+    pub fn short_id(&self) -> &str {
+        let id = &self.frontmatter.id;
+        &id[id.len().saturating_sub(7)..]
+    }
+
     pub fn to_file_contents(&self) -> Result<String> {
         let yaml = serde_yaml::to_string(&self.frontmatter).context("serializing frontmatter")?;
         Ok(format!("---\n{yaml}---\n{}", self.body))
