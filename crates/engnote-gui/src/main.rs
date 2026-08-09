@@ -1,3 +1,4 @@
+mod markdown;
 mod theme;
 mod vim;
 
@@ -24,7 +25,7 @@ fn main() -> eframe::Result<()> {
     let vault_dir = vault::resolve_vault_dir().expect("resolving vault dir");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1040.0, 680.0])
+            .with_inner_size([1180.0, 900.0])
             .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
@@ -554,6 +555,8 @@ enum GuiAction {
     StartEdit(EditForm),
     Save,
     Cancel,
+    /// Jump to another note by index (clicking an outgoing link/backlink).
+    SelectNote(usize),
 }
 
 /// Renders one note as a clickable card and returns its (post-hoc clickable) response.
@@ -604,6 +607,41 @@ fn note_card(ui: &mut egui::Ui, note: &Note, selected: bool) -> egui::Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     response
+}
+
+/// Renders a row of clickable note-reference chips (outgoing `[[links]]` or
+/// backlinks); returns the note index whose chip was clicked, if any.
+fn link_row(ui: &mut egui::Ui, links: &[(usize, String)]) -> Option<usize> {
+    let mut clicked = None;
+    ui.horizontal_wrapped(|ui| {
+        for (idx, title) in links {
+            let title = if title.is_empty() { "(無題)" } else { title.as_str() };
+            let resp = ui.add(
+                egui::Button::new(egui::RichText::new(format!("→ {title}")).color(theme::ACCENT))
+                    .fill(theme::ACCENT.gamma_multiply(0.14))
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT.gamma_multiply(0.5)))
+                    .corner_radius(egui::CornerRadius::same(14)),
+            );
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if resp.clicked() {
+                clicked = Some(*idx);
+            }
+        }
+    });
+    clicked
+}
+
+/// Like `Ui::add_sized`, but top-left aligned instead of centered (egui's
+/// `add_sized` always uses `Layout::centered_and_justified`, which is wrong
+/// for body text — it visually centers every line instead of just filling
+/// the box).
+fn add_sized_top_left(ui: &mut egui::Ui, size: impl Into<egui::Vec2>, widget: impl egui::Widget) -> egui::Response {
+    ui.allocate_ui_with_layout(size.into(), egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.add(widget)
+    })
+    .inner
 }
 
 /// Renders a single-line vim field (title/tags): the live `TextEdit` when
@@ -783,6 +821,32 @@ impl eframe::App for App {
             Mode::Viewing => {
                 if let Some(i) = self.selected {
                     let (path, note) = &self.notes[i];
+
+                    let mut outgoing: Vec<(usize, String)> = Vec::new();
+                    for link_text in engnote_core::linking::extract_links(&note.body) {
+                        if let engnote_core::linking::LinkTarget::Resolved(id) =
+                            engnote_core::linking::resolve_link(&self.notes, link_text)
+                        {
+                            if let Some(idx) = self.notes.iter().position(|(_, n)| n.frontmatter.id == id) {
+                                if idx != i && !outgoing.iter().any(|(oi, _)| *oi == idx) {
+                                    outgoing.push((idx, self.notes[idx].1.frontmatter.title.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let backlinks: Vec<(usize, String)> = engnote_core::linking::backlinks(
+                        &self.notes,
+                        &note.frontmatter.id,
+                    )
+                    .iter()
+                    .filter_map(|n| {
+                        self.notes
+                            .iter()
+                            .position(|(_, x)| x.frontmatter.id == n.frontmatter.id)
+                            .map(|idx| (idx, n.frontmatter.title.clone()))
+                    })
+                    .collect();
+
                     egui::ScrollArea::vertical()
                         .id_salt("view-scroll")
                         .auto_shrink([false, false])
@@ -842,8 +906,42 @@ impl eframe::App for App {
                                         .inner_margin(egui::Margin::same(18))
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            ui.label(&note.body);
+                                            markdown::render(
+                                                ui,
+                                                &note.body,
+                                                &markdown::Palette {
+                                                    text: theme::TEXT,
+                                                    dim: theme::TEXT_DIM,
+                                                    strong: egui::Color32::WHITE,
+                                                    accent: theme::ACCENT,
+                                                    code_bg: theme::BG,
+                                                },
+                                            );
                                         });
+
+                                    if !outgoing.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            egui::RichText::new("リンク").small().color(theme::TEXT_DIM),
+                                        );
+                                        ui.add_space(4.0);
+                                        if let Some(idx) = link_row(ui, &outgoing) {
+                                            action = Some(GuiAction::SelectNote(idx));
+                                        }
+                                    }
+
+                                    if !backlinks.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            egui::RichText::new("バックリンク")
+                                                .small()
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        ui.add_space(4.0);
+                                        if let Some(idx) = link_row(ui, &backlinks) {
+                                            action = Some(GuiAction::SelectNote(idx));
+                                        }
+                                    }
                                 });
                         });
                 } else {
@@ -909,23 +1007,15 @@ impl eframe::App for App {
                                     form.active_field = ActiveField::Tags;
                                     form.clamp_cursor();
                                 }
-                                ui.add_space(10.0);
-
-                                ui.label(
-                                    egui::RichText::new("ステータス")
-                                        .small()
-                                        .color(theme::TEXT_DIM),
-                                );
-                                egui::ComboBox::from_id_salt("status")
-                                    .selected_text(form.status.to_string())
-                                    .show_ui(ui, |ui| {
-                                        for s in [Status::Draft, Status::Active, Status::Archived] {
-                                            ui.selectable_value(&mut form.status, s, s.to_string());
-                                        }
-                                    });
                                 ui.add_space(16.0);
 
                                 ui.label(egui::RichText::new("本文").small().color(theme::TEXT_DIM));
+                                // Fill whatever room is left in the window instead of a fixed
+                                // height, so the body editor doesn't look cramped on a large
+                                // window (leave some space for the save/cancel row below it).
+                                let body_height = (ui.available_height() - 70.0).max(180.0);
+                                let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                                let body_rows = ((body_height / row_height).floor() as usize).max(6);
                                 egui::Frame::new()
                                     .fill(theme::CARD_BG)
                                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
@@ -934,7 +1024,7 @@ impl eframe::App for App {
                                     .show(ui, |ui| {
                                         egui::ScrollArea::vertical()
                                             .id_salt("edit-body-scroll")
-                                            .max_height(360.0)
+                                            .max_height(body_height)
                                             .show(ui, |ui| {
                                                 if form.active_field != ActiveField::Body {
                                                     let display = if form.body.is_empty() {
@@ -942,17 +1032,18 @@ impl eframe::App for App {
                                                     } else {
                                                         form.body.clone()
                                                     };
-                                                    let clicked = ui
-                                                        .add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(display)
-                                                                    .color(theme::TEXT_DIM),
-                                                            )
-                                                            .selectable(false)
-                                                            .sense(egui::Sense::click())
-                                                            .wrap_mode(egui::TextWrapMode::Wrap),
+                                                    let clicked = add_sized_top_left(
+                                                        ui,
+                                                        [ui.available_width(), body_height],
+                                                        egui::Label::new(
+                                                            egui::RichText::new(display)
+                                                                .color(theme::TEXT_DIM),
                                                         )
-                                                        .clicked();
+                                                        .selectable(false)
+                                                        .sense(egui::Sense::click())
+                                                        .wrap_mode(egui::TextWrapMode::Wrap),
+                                                    )
+                                                    .clicked();
                                                     if clicked {
                                                         form.active_field = ActiveField::Body;
                                                         form.clamp_cursor();
@@ -964,7 +1055,7 @@ impl eframe::App for App {
                                                             let mut output = egui::TextEdit::multiline(&mut form.body)
                                                                 .id(body_id)
                                                                 .frame(false)
-                                                                .desired_rows(18)
+                                                                .desired_rows(body_rows)
                                                                 .desired_width(f32::INFINITY)
                                                                 .show(ui);
                                                             if form.just_entered_insert {
@@ -987,7 +1078,9 @@ impl eframe::App for App {
                                                                 theme::ACCENT,
                                                                 theme::BG,
                                                             );
-                                                            ui.add(
+                                                            add_sized_top_left(
+                                                                ui,
+                                                                [ui.available_width(), body_height],
                                                                 egui::Label::new(job)
                                                                     .selectable(false)
                                                                     .wrap_mode(egui::TextWrapMode::Wrap),
@@ -1024,6 +1117,10 @@ impl eframe::App for App {
                 }
             }
             Some(GuiAction::Cancel) => self.mode = Mode::Viewing,
+            Some(GuiAction::SelectNote(i)) => {
+                self.selected = Some(i);
+                self.mode = Mode::Viewing;
+            }
             None => {}
         }
     }
