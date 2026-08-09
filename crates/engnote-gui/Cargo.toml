@@ -1,0 +1,25 @@
+[package]
+name = "engnote-gui"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "engnote-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+eframe = "0.32.3"
+engnote-core = { path = "../engnote-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSImage", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSString"] }
+
+[package.metadata.bundle]
+name = "engnote"
+identifier = "dev.ybk-tomoya.engnote"
+icon = ["icons/AppIcon.icns"]
+short_description = "Notionに閉じずローカルのディレクトリ構造とも紐付けられる、エンジニア向けの万能メモアプリ"
