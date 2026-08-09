@@ -68,6 +68,14 @@ pub fn handle_normal_key(
             *cursor = (*cursor + 1).min(len);
             *editor_mode = EditorMode::Insert;
         }
+        'I' => {
+            *cursor = line_bounds(&chars, *cursor).0;
+            *editor_mode = EditorMode::Insert;
+        }
+        'A' => {
+            *cursor = line_bounds(&chars, *cursor).1;
+            *editor_mode = EditorMode::Insert;
+        }
         'o' => {
             let (_, end) = line_bounds(&chars, *cursor);
             chars.insert(end, '\n');
@@ -354,6 +362,22 @@ mod tests {
         let mut st = form_with("abc", 3);
         keys(&mut st, "a");
         assert_eq!(st.cursor, 3); // already at end, doesn't overshoot
+    }
+
+    #[test]
+    fn shift_a_appends_at_end_of_line_not_just_after_cursor() {
+        let mut st = form_with("hello\nworld", 1); // 'e' in "hello"
+        keys(&mut st, "A");
+        assert_eq!(st.cursor, 5); // right after "hello", before the '\n'
+        assert_eq!(st.mode, EditorMode::Insert);
+    }
+
+    #[test]
+    fn shift_i_inserts_at_start_of_line() {
+        let mut st = form_with("hello\nworld", 8); // 'r' in "world"
+        keys(&mut st, "I");
+        assert_eq!(st.cursor, 6); // start of "world"
+        assert_eq!(st.mode, EditorMode::Insert);
     }
 
     #[test]
