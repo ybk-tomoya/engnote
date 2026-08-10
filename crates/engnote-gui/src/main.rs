@@ -13,14 +13,16 @@ use engnote_core::vault;
 /// Id of the sidebar filter `TextEdit`, so global key handling can tell
 /// whether it currently has focus (and can request/surrender that focus).
 const FILTER_ID: &str = "engnote-filter";
-/// Id of the body `TextEdit` shown in vim Insert mode; used to read back its
-/// live cursor position when leaving Insert mode (see `EditForm::cursor`).
+/// Id *key* of the body `TextEdit` shown in vim Insert mode; combined with
+/// the (group, tab) it belongs to — see `ActiveField::id`.
 const EDIT_BODY_ID: &str = "engnote-edit-body";
 /// Same idea as `EDIT_BODY_ID`, for the title and tags fields.
 const TITLE_FIELD_ID: &str = "engnote-edit-title";
 const TAGS_FIELD_ID: &str = "engnote-edit-tags";
 /// Id of the `:command` line's `TextEdit` in the bottom status bar.
 const COMMAND_ID: &str = "engnote-command";
+/// Id of the Cmd+P quick-switcher's query `TextEdit`.
+const QUICK_SWITCHER_ID: &str = "engnote-quick-switcher";
 
 fn main() -> eframe::Result<()> {
     let vault_dir = vault::resolve_vault_dir().expect("resolving vault dir");
@@ -137,12 +139,19 @@ enum ActiveField {
 }
 
 impl ActiveField {
-    fn id(self) -> egui::Id {
-        egui::Id::new(match self {
+    /// Every open tab (in every group) renders its own title/tags/body
+    /// `TextEdit`s, but only the active one is ever shown in a given frame —
+    /// so without a per-(group, tab) id, switching away from a mid-edit tab
+    /// and back would hand its `TextEdit` some *other* tab's stale
+    /// cursor/selection state (both would otherwise share the same egui
+    /// persisted-widget id).
+    fn id(self, group: usize, tab: usize) -> egui::Id {
+        let key = match self {
             ActiveField::Title => TITLE_FIELD_ID,
             ActiveField::Tags => TAGS_FIELD_ID,
             ActiveField::Body => EDIT_BODY_ID,
-        })
+        };
+        egui::Id::new((key, group, tab))
     }
 }
 
@@ -295,16 +304,70 @@ impl EditForm {
     }
 }
 
+/// One open tab: which note it shows (`None` for a blank tab) and whether
+/// it's in Viewing or Editing mode.
+struct Tab {
+    selected: Option<usize>,
+    mode: Mode,
+}
+
+impl Tab {
+    fn blank() -> Self {
+        Tab { selected: None, mode: Mode::Viewing }
+    }
+
+    /// The tab bar's label for this tab: the live title while editing
+    /// (reflecting an unsaved rename), the note's title while viewing, or a
+    /// placeholder for an empty/new tab.
+    fn label(&self, notes: &[(PathBuf, Note)]) -> String {
+        if let Mode::Editing(form) = &self.mode {
+            let title = if form.title.is_empty() { "無題" } else { &form.title };
+            return format!("✎ {title}");
+        }
+        match self.selected.and_then(|i| notes.get(i)) {
+            Some((_, note)) if !note.frontmatter.title.is_empty() => note.frontmatter.title.clone(),
+            Some(_) => "(無題)".to_string(),
+            None => "新規タブ".to_string(),
+        }
+    }
+}
+
+/// A "tab group": its own horizontal row of tabs, switched independently of
+/// other groups. Groups themselves are switched via the left-side rail (see
+/// `group_rail`) with `Ctrl+J`/`Ctrl+K`; tabs within the active group switch
+/// with `Ctrl+H`/`Ctrl+L`.
+struct Group {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+}
+
+impl Group {
+    fn blank() -> Self {
+        Group { tabs: vec![Tab::blank()], active_tab: 0 }
+    }
+}
+
+/// Cmd+P "quick open": type to filter notes by title/tag, Up/Down to move
+/// the highlight, Enter/click to open the highlighted note in the active
+/// tab. See `render_quick_switcher` and `App::handle_quick_switcher_keys`.
+#[derive(Default)]
+struct QuickSwitcher {
+    query: String,
+    selected: usize,
+}
+
 struct App {
     vault_dir: PathBuf,
     notes: Vec<(PathBuf, Note)>,
-    selected: Option<usize>,
+    groups: Vec<Group>,
+    active_group: usize,
     filter: String,
-    mode: Mode,
     error: Option<String>,
     dock_icon_set: bool,
     /// `Some(buffer)` while the `:command` line (opened with `:`) is active.
     command_input: Option<String>,
+    /// `Some` while the Cmd+P quick-switcher overlay is open.
+    quick_switcher: Option<QuickSwitcher>,
 }
 
 impl App {
@@ -312,12 +375,13 @@ impl App {
         let mut app = App {
             vault_dir,
             notes: Vec::new(),
-            selected: None,
+            groups: vec![Group::blank()],
+            active_group: 0,
             filter: String::new(),
-            mode: Mode::Viewing,
             error: None,
             dock_icon_set: false,
             command_input: None,
+            quick_switcher: None,
         };
         app.reload();
         app
@@ -330,8 +394,18 @@ impl App {
         }
     }
 
+    /// `(active_group, active_tab-within-that-group)`, computed fresh each
+    /// call — cheap, and avoids holding a borrow across the many places that
+    /// need these two indices alongside other `self` fields.
+    fn active_indices(&self) -> (usize, usize) {
+        let gi = self.active_group;
+        (gi, self.groups[gi].active_tab)
+    }
+
     fn select_by_id(&mut self, id: &str) {
-        self.selected = self.notes.iter().position(|(_, n)| n.frontmatter.id == id);
+        let idx = self.notes.iter().position(|(_, n)| n.frontmatter.id == id);
+        let (gi, ti) = self.active_indices();
+        self.groups[gi].tabs[ti].selected = idx;
     }
 
     fn save_edit(&mut self, form: EditForm) {
@@ -354,15 +428,16 @@ impl App {
             Ok(_) => {
                 self.reload();
                 self.select_by_id(&id);
-                self.mode = Mode::Viewing;
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].mode = Mode::Viewing;
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("保存に失敗: {e:#}")),
         }
     }
 
-    /// Moves `self.selected` up/down by one within the currently filtered
-    /// note list (`j`/`k`).
+    /// Moves the active tab's selection up/down by one within the currently
+    /// filtered note list (`j`/`k`).
     fn select_relative(&mut self, delta: i32) {
         let filter = self.filter.to_lowercase();
         let visible: Vec<usize> = self
@@ -379,12 +454,75 @@ impl App {
         if visible.is_empty() {
             return;
         }
-        let current = self.selected.and_then(|s| visible.iter().position(|&i| i == s));
+        let (gi, ti) = self.active_indices();
+        let selected = self.groups[gi].tabs[ti].selected;
+        let current = selected.and_then(|s| visible.iter().position(|&i| i == s));
         let next = match current {
             Some(p) => (p as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
             None => 0,
         };
-        self.selected = Some(visible[next]);
+        self.groups[gi].tabs[ti].selected = Some(visible[next]);
+    }
+
+    /// Opens a new blank tab in the active group and makes it active
+    /// (Cmd+T / tab bar `＋`).
+    fn new_tab(&mut self) {
+        let gi = self.active_group;
+        let group = &mut self.groups[gi];
+        group.tabs.push(Tab::blank());
+        group.active_tab = group.tabs.len() - 1;
+    }
+
+    /// Closes a tab in the active group (× on the tab bar / Cmd+W). If it's
+    /// the group's only tab, closes the whole group instead (provided
+    /// there's another group to fall back to) rather than leaving an empty
+    /// group behind — this is also the only way to close a group.
+    fn close_tab(&mut self, index: usize) {
+        let gi = self.active_group;
+        if index >= self.groups[gi].tabs.len() {
+            return;
+        }
+        if self.groups[gi].tabs.len() == 1 {
+            self.close_group(gi);
+            return;
+        }
+        let group = &mut self.groups[gi];
+        group.tabs.remove(index);
+        if group.active_tab > index || group.active_tab >= group.tabs.len() {
+            group.active_tab = group.active_tab.saturating_sub(1).min(group.tabs.len() - 1);
+        }
+    }
+
+    /// Cycles the active tab within the active group, wrapping around
+    /// (`Ctrl+H`/`Ctrl+L`).
+    fn cycle_tab(&mut self, delta: i32) {
+        let gi = self.active_group;
+        let group = &mut self.groups[gi];
+        let len = group.tabs.len() as i32;
+        group.active_tab = (group.active_tab as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    /// Opens a new group (with one blank tab) and makes it active (tab-rail `＋`).
+    fn new_group(&mut self) {
+        self.groups.push(Group::blank());
+        self.active_group = self.groups.len() - 1;
+    }
+
+    /// Closes a group, keeping at least one group open.
+    fn close_group(&mut self, index: usize) {
+        if self.groups.len() <= 1 || index >= self.groups.len() {
+            return;
+        }
+        self.groups.remove(index);
+        if self.active_group > index || self.active_group >= self.groups.len() {
+            self.active_group = self.active_group.saturating_sub(1).min(self.groups.len() - 1);
+        }
+    }
+
+    /// Cycles the active group, wrapping around (`Ctrl+J`/`Ctrl+K`).
+    fn cycle_group(&mut self, delta: i32) {
+        let len = self.groups.len() as i32;
+        self.active_group = (self.active_group as i32 + delta).rem_euclid(len) as usize;
     }
 
     /// App-wide vim-style keyboard shortcuts. Skipped whenever some other
@@ -396,6 +534,11 @@ impl App {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                 ctx.memory_mut(|m| m.surrender_focus(filter_id));
             }
+            return;
+        }
+
+        if self.quick_switcher.is_some() {
+            self.handle_quick_switcher_keys(ctx);
             return;
         }
 
@@ -414,7 +557,41 @@ impl App {
             return;
         }
 
-        if matches!(self.mode, Mode::Editing(_)) {
+        // Tab/group management: modifier-key combos, so these are safe to
+        // check globally (before Viewing/Editing dispatch below) without
+        // colliding with plain-character typing in any text field.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
+            self.new_tab();
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+            let (_, ti) = self.active_indices();
+            self.close_tab(ti);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.quick_switcher = Some(QuickSwitcher::default());
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
+            self.cycle_tab(1);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H)) {
+            self.cycle_tab(-1);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::J)) {
+            self.cycle_group(1);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
+            self.cycle_group(-1);
+            return;
+        }
+
+        let (gi, ti) = self.active_indices();
+        if matches!(self.groups[gi].tabs[ti].mode, Mode::Editing(_)) {
             self.handle_editing_keys(ctx);
         } else {
             self.handle_viewing_keys(ctx, filter_id);
@@ -423,16 +600,20 @@ impl App {
 
     /// Executes a vim-style `:command` (see the bottom command line).
     fn execute_command(&mut self, cmd: &str) {
+        let (gi, ti) = self.active_indices();
         match cmd.trim() {
             "e" | "new" | "enew" => {
-                self.mode = Mode::Editing(EditForm::blank());
-                self.selected = None;
+                self.groups[gi].tabs[ti].mode = Mode::Editing(EditForm::blank());
+                self.groups[gi].tabs[ti].selected = None;
             }
             "w" | "wq" | "x" => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
+                let old = std::mem::replace(&mut self.groups[gi].tabs[ti].mode, Mode::Viewing);
+                if let Mode::Editing(form) = old {
                     self.save_edit(form);
                 }
             }
+            "tabnew" | "tabe" => self.new_tab(),
+            "tabclose" | "tabc" => self.close_tab(ti),
             _ => {}
         }
     }
@@ -441,20 +622,21 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
+        let (gi, ti) = self.active_indices();
         for ch in collect_text_chars(ctx) {
             match ch {
                 'j' => self.select_relative(1),
                 'k' => self.select_relative(-1),
                 'n' => {
-                    self.mode = Mode::Editing(EditForm::blank());
-                    self.selected = None;
+                    self.groups[gi].tabs[ti].mode = Mode::Editing(EditForm::blank());
+                    self.groups[gi].tabs[ti].selected = None;
                     return;
                 }
                 'e' | 'i' => {
-                    if let Some(idx) = self.selected {
+                    if let Some(idx) = self.groups[gi].tabs[ti].selected {
                         let path = self.notes[idx].0.clone();
                         let note = self.notes[idx].1.clone();
-                        self.mode = Mode::Editing(EditForm::from_note(path, &note));
+                        self.groups[gi].tabs[ti].mode = Mode::Editing(EditForm::from_note(path, &note));
                         return;
                     }
                 }
@@ -478,7 +660,8 @@ impl App {
         }
         let mut intent = Intent::None;
 
-        if let Mode::Editing(form) = &mut self.mode {
+        let (gi, ti) = self.active_indices();
+        if let Mode::Editing(form) = &mut self.groups[gi].tabs[ti].mode {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
                 intent = Intent::Save;
             } else if form.editor_mode == vim::EditorMode::Insert {
@@ -511,7 +694,7 @@ impl App {
                         }
                     }
                 } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    let field_id = form.active_field.id();
+                    let field_id = form.active_field.id(gi, ti);
                     if let Some(range) = egui::text_edit::TextEditState::load(ctx, field_id)
                         .and_then(|state| state.cursor.char_range())
                     {
@@ -560,15 +743,159 @@ impl App {
         }
 
         match intent {
-            Intent::ExitToViewing => self.mode = Mode::Viewing,
+            Intent::ExitToViewing => self.groups[gi].tabs[ti].mode = Mode::Viewing,
             Intent::Save => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
+                let old = std::mem::replace(&mut self.groups[gi].tabs[ti].mode, Mode::Viewing);
+                if let Mode::Editing(form) = old {
                     self.save_edit(form);
                 }
             }
             Intent::None => {}
         }
     }
+
+    /// Handles Escape/Up/Down/Enter for the Cmd+P quick-switcher overlay;
+    /// ordinary typing into its query box is handled by the live `TextEdit`
+    /// in `render_quick_switcher` (same split as the `/` command menu).
+    fn handle_quick_switcher_keys(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.quick_switcher = None;
+            return;
+        }
+        let Some((query, mut selected)) = self
+            .quick_switcher
+            .as_ref()
+            .map(|qs| (qs.query.clone(), qs.selected))
+        else {
+            return;
+        };
+        let matches = quick_switcher_matches(&self.notes, &query);
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            if !matches.is_empty() {
+                selected = (selected + 1) % matches.len();
+            }
+        } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            if !matches.is_empty() {
+                selected = (selected + matches.len() - 1) % matches.len();
+            }
+        } else if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            self.quick_switcher = None;
+            if let Some(&idx) = matches.get(selected) {
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].selected = Some(idx);
+                self.groups[gi].tabs[ti].mode = Mode::Viewing;
+            }
+            return;
+        }
+
+        if let Some(qs) = &mut self.quick_switcher {
+            qs.selected = selected;
+        }
+    }
+}
+
+/// Notes matching the quick-switcher's typed query (title/tag substring,
+/// case-insensitive), in note-list order.
+fn quick_switcher_matches(notes: &[(PathBuf, Note)], query: &str) -> Vec<usize> {
+    let q = query.to_lowercase();
+    notes
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, n))| {
+            q.is_empty()
+                || n.frontmatter.title.to_lowercase().contains(&q)
+                || n.frontmatter.tags.iter().any(|t| t.to_lowercase().contains(&q))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Renders the Cmd+P quick-switcher overlay (query box + filtered note
+/// list); returns the note index to open if the user clicked a match
+/// (Enter is handled separately in `App::handle_quick_switcher_keys`, since
+/// that needs to run before the `TextEdit` below claims the keystroke).
+fn render_quick_switcher(
+    ctx: &egui::Context,
+    notes: &[(PathBuf, Note)],
+    switcher: &mut QuickSwitcher,
+) -> Option<usize> {
+    let mut opened = None;
+    egui::Area::new(egui::Id::new(QUICK_SWITCHER_ID))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 90.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD_BG)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.set_width(440.0);
+                    let field_id = egui::Id::new((QUICK_SWITCHER_ID, "input"));
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut switcher.query)
+                            .id(field_id)
+                            .hint_text("ノートを検索… (Esc で閉じる)")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if ctx.memory(|m| m.focused()) != Some(field_id) {
+                        response.request_focus();
+                    }
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+
+                    let matches = quick_switcher_matches(notes, &switcher.query);
+                    switcher.selected = switcher.selected.min(matches.len().saturating_sub(1));
+
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        if matches.is_empty() {
+                            ui.label(
+                                egui::RichText::new("一致するノートなし").small().color(theme::TEXT_DIM),
+                            );
+                            return;
+                        }
+                        for (row, &idx) in matches.iter().enumerate() {
+                            let (_, note) = &notes[idx];
+                            let title = if note.frontmatter.title.is_empty() {
+                                "(無題)"
+                            } else {
+                                note.frontmatter.title.as_str()
+                            };
+                            let bg = if row == switcher.selected {
+                                theme::ACCENT.gamma_multiply(0.25)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            let resp = egui::Frame::new()
+                                .fill(bg)
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(egui::RichText::new(title).color(theme::TEXT));
+                                    if !note.frontmatter.tags.is_empty() {
+                                        ui.horizontal_wrapped(|ui| {
+                                            for t in &note.frontmatter.tags {
+                                                theme::badge(ui, t, theme::TEXT_DIM);
+                                            }
+                                        });
+                                    }
+                                })
+                                .response
+                                .interact(egui::Sense::click());
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                opened = Some(idx);
+                            }
+                        }
+                    });
+                });
+        });
+    opened
 }
 
 /// Re-derives `slash_menu`'s open/closed state and filter query from the
@@ -789,6 +1116,122 @@ enum GuiAction {
     SelectNote(usize),
 }
 
+/// What the tab bar was clicked to do.
+enum TabBarAction {
+    Switch(usize),
+    Close(usize),
+    New,
+}
+
+/// Renders the active group's tab bar (horizontal, top of the central
+/// panel): one chip per tab plus a trailing `＋`.
+fn tab_bar(ui: &mut egui::Ui, tabs: &[Tab], active_tab: usize, notes: &[(PathBuf, Note)]) -> Option<TabBarAction> {
+    let mut action = None;
+    egui::ScrollArea::horizontal().id_salt("tab-bar-scroll").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            for (i, tab) in tabs.iter().enumerate() {
+                let is_active = i == active_tab;
+                let (bg, border, text_color) = if is_active {
+                    (theme::CARD_BG, theme::ACCENT, theme::TEXT)
+                } else {
+                    (theme::PANEL_BG, theme::BORDER, theme::TEXT_DIM)
+                };
+                egui::Frame::new()
+                    .fill(bg)
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::symmetric(10, 5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let resp = ui.add(
+                                egui::Label::new(egui::RichText::new(tab.label(notes)).color(text_color))
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if resp.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if resp.clicked() {
+                                action = Some(TabBarAction::Switch(i));
+                            }
+                            let close = ui.add(
+                                egui::Label::new(egui::RichText::new("×").color(theme::TEXT_DIM))
+                                    .selectable(false)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if close.hovered() {
+                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+                            if close.clicked() {
+                                action = Some(TabBarAction::Close(i));
+                            }
+                        });
+                    });
+            }
+            if ui.add(egui::Button::new("＋").frame(false)).clicked() {
+                action = Some(TabBarAction::New);
+            }
+        });
+    });
+    action
+}
+
+/// What the group rail was clicked to do.
+enum GroupRailAction {
+    Switch(usize),
+    Close(usize),
+    New,
+}
+
+/// Renders the leftmost group rail (vertical): one numbered pill per group,
+/// hover shows that group's active-tab label, plus a trailing `＋`.
+fn group_rail(ui: &mut egui::Ui, groups: &[Group], active_group: usize, notes: &[(PathBuf, Note)]) -> Option<GroupRailAction> {
+    let mut action = None;
+    egui::ScrollArea::vertical().id_salt("group-rail-scroll").show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            for (i, group) in groups.iter().enumerate() {
+                let is_active = i == active_group;
+                let (bg, border, text_color) = if is_active {
+                    (theme::ACCENT.gamma_multiply(0.28), theme::ACCENT, theme::TEXT)
+                } else {
+                    (theme::CARD_BG, theme::BORDER, theme::TEXT_DIM)
+                };
+                let hover_label = group.tabs[group.active_tab].label(notes);
+                let resp = egui::Frame::new()
+                    .fill(bg)
+                    .stroke(egui::Stroke::new(1.0, border))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .inner_margin(egui::Margin::symmetric(0, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(32.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(egui::RichText::new((i + 1).to_string()).color(text_color).strong());
+                        });
+                    })
+                    .response
+                    .interact(egui::Sense::click())
+                    .on_hover_text(hover_label);
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if resp.clicked() {
+                    action = Some(GroupRailAction::Switch(i));
+                }
+                // Right-click closes the group (its tab count usually makes
+                // a per-item `×` too cramped for this narrow a rail).
+                if resp.secondary_clicked() && groups.len() > 1 {
+                    action = Some(GroupRailAction::Close(i));
+                }
+                ui.add_space(6.0);
+            }
+            if ui.add(egui::Button::new("＋").frame(false)).clicked() {
+                action = Some(GroupRailAction::New);
+            }
+        });
+    });
+    action
+}
+
 /// Renders one note as a clickable card and returns its (post-hoc clickable) response.
 fn note_card(ui: &mut egui::Ui, note: &Note, selected: bool) -> egui::Response {
     let (bg, border) = if selected {
@@ -947,6 +1390,8 @@ impl eframe::App for App {
         self.handle_global_keys(ctx);
 
         let mut action: Option<GuiAction> = None;
+        let mut tab_bar_action: Option<TabBarAction> = None;
+        let mut group_rail_action: Option<GroupRailAction> = None;
 
         if let Some(err) = &self.error {
             egui::TopBottomPanel::top("error")
@@ -959,6 +1404,8 @@ impl eframe::App for App {
                     ui.colored_label(egui::Color32::from_rgb(255, 130, 130), format!("⚠ {err}"));
                 });
         }
+
+        let (active_gi, active_ti) = self.active_indices();
 
         egui::TopBottomPanel::bottom("statusbar")
             .frame(
@@ -981,7 +1428,7 @@ impl eframe::App for App {
                             response.request_focus();
                         }
                     });
-                } else if let Mode::Editing(form) = &self.mode {
+                } else if let Mode::Editing(form) = &self.groups[active_gi].tabs[active_ti].mode {
                     let (text, color) = match form.editor_mode {
                         vim::EditorMode::Normal => ("-- NORMAL --", theme::TEXT_DIM),
                         vim::EditorMode::Insert => {
@@ -991,11 +1438,25 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new(text).monospace().strong().color(color));
                 } else {
                     ui.label(
-                        egui::RichText::new("j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド")
-                            .small()
-                            .color(theme::TEXT_DIM),
+                        egui::RichText::new(
+                            "j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド ・ Ctrl+H/L タブ ・ Ctrl+J/K グループ ・ Cmd+T/W/P タブ操作",
+                        )
+                        .small()
+                        .color(theme::TEXT_DIM),
                     );
                 }
+            });
+
+        egui::SidePanel::left("groups")
+            .resizable(false)
+            .exact_width(52.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL_BG)
+                    .inner_margin(egui::Margin::symmetric(6, 12)),
+            )
+            .show(ctx, |ui| {
+                group_rail_action = group_rail(ui, &self.groups, self.active_group, &self.notes);
             });
 
         egui::SidePanel::left("notes")
@@ -1026,6 +1487,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
 
                 let filter = self.filter.to_lowercase();
+                let currently_selected = self.groups[active_gi].tabs[active_ti].selected;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (i, (_, note)) in self.notes.iter().enumerate() {
                         let matches = filter.is_empty()
@@ -1038,18 +1500,26 @@ impl eframe::App for App {
                         if !matches {
                             continue;
                         }
-                        if note_card(ui, note, self.selected == Some(i)).clicked() {
-                            self.selected = Some(i);
-                            self.mode = Mode::Viewing;
+                        if note_card(ui, note, currently_selected == Some(i)).clicked() {
+                            self.groups[active_gi].tabs[active_ti].selected = Some(i);
+                            self.groups[active_gi].tabs[active_ti].mode = Mode::Viewing;
                         }
                         ui.add_space(6.0);
                     }
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match &mut self.mode {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    tab_bar_action = tab_bar(ui, &self.groups[active_gi].tabs, active_ti, &self.notes);
+                });
+            ui.separator();
+
+            match &mut self.groups[active_gi].tabs[active_ti].mode {
             Mode::Viewing => {
-                if let Some(i) = self.selected {
+                if let Some(i) = self.groups[active_gi].tabs[active_ti].selected {
                     let (path, note) = &self.notes[i];
 
                     let mut outgoing: Vec<(usize, String)> = Vec::new();
@@ -1212,7 +1682,7 @@ impl eframe::App for App {
                                     form.active_field == ActiveField::Title,
                                     form.editor_mode,
                                     form.cursor,
-                                    egui::Id::new(TITLE_FIELD_ID),
+                                    ActiveField::Title.id(active_gi, active_ti),
                                     &mut form.just_entered_insert,
                                 ) {
                                     form.active_field = ActiveField::Title;
@@ -1232,7 +1702,7 @@ impl eframe::App for App {
                                     form.active_field == ActiveField::Tags,
                                     form.editor_mode,
                                     form.cursor,
-                                    egui::Id::new(TAGS_FIELD_ID),
+                                    ActiveField::Tags.id(active_gi, active_ti),
                                     &mut form.just_entered_insert,
                                 ) {
                                     form.active_field = ActiveField::Tags;
@@ -1283,7 +1753,7 @@ impl eframe::App for App {
                                                 } else {
                                                     match form.editor_mode {
                                                         vim::EditorMode::Insert => {
-                                                            let body_id = egui::Id::new(EDIT_BODY_ID);
+                                                            let body_id = ActiveField::Body.id(active_gi, active_ti);
                                                             let mut output = egui::TextEdit::multiline(&mut form.body)
                                                                 .id(body_id)
                                                                 .frame(false)
@@ -1349,24 +1819,60 @@ impl eframe::App for App {
                             });
                     });
             }
+            }
         });
+
+        if let Some(mut switcher) = self.quick_switcher.take() {
+            match render_quick_switcher(ctx, &self.notes, &mut switcher) {
+                Some(idx) => {
+                    let (gi, ti) = self.active_indices();
+                    self.groups[gi].tabs[ti].selected = Some(idx);
+                    self.groups[gi].tabs[ti].mode = Mode::Viewing;
+                }
+                None => self.quick_switcher = Some(switcher),
+            }
+        }
 
         match action {
             Some(GuiAction::StartNew) => {
-                self.mode = Mode::Editing(EditForm::blank());
-                self.selected = None;
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].mode = Mode::Editing(EditForm::blank());
+                self.groups[gi].tabs[ti].selected = None;
             }
-            Some(GuiAction::StartEdit(form)) => self.mode = Mode::Editing(form),
+            Some(GuiAction::StartEdit(form)) => {
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].mode = Mode::Editing(form);
+            }
             Some(GuiAction::Save) => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
+                let (gi, ti) = self.active_indices();
+                let old = std::mem::replace(&mut self.groups[gi].tabs[ti].mode, Mode::Viewing);
+                if let Mode::Editing(form) = old {
                     self.save_edit(form);
                 }
             }
-            Some(GuiAction::Cancel) => self.mode = Mode::Viewing,
-            Some(GuiAction::SelectNote(i)) => {
-                self.selected = Some(i);
-                self.mode = Mode::Viewing;
+            Some(GuiAction::Cancel) => {
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].mode = Mode::Viewing;
             }
+            Some(GuiAction::SelectNote(i)) => {
+                let (gi, ti) = self.active_indices();
+                self.groups[gi].tabs[ti].selected = Some(i);
+                self.groups[gi].tabs[ti].mode = Mode::Viewing;
+            }
+            None => {}
+        }
+
+        match tab_bar_action {
+            Some(TabBarAction::Switch(i)) => self.groups[self.active_group].active_tab = i,
+            Some(TabBarAction::Close(i)) => self.close_tab(i),
+            Some(TabBarAction::New) => self.new_tab(),
+            None => {}
+        }
+
+        match group_rail_action {
+            Some(GroupRailAction::Switch(i)) => self.active_group = i,
+            Some(GroupRailAction::Close(i)) => self.close_group(i),
+            Some(GroupRailAction::New) => self.new_group(),
             None => {}
         }
     }
