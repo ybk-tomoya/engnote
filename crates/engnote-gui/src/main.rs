@@ -501,7 +501,14 @@ impl App {
                         move_slash_selection(form, -1);
                     } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
                     {
-                        apply_slash_command(form);
+                        if !apply_slash_command(form) {
+                            // Nothing matched the typed query (e.g. the user
+                            // is just writing a `/etc/hosts`-style path, not
+                            // a command): close the menu and fall back to an
+                            // ordinary newline, since we already stole this
+                            // Enter from the `TextEdit` above.
+                            close_slash_menu_with_newline(form);
+                        }
                     }
                 } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     let field_id = form.active_field.id();
@@ -614,16 +621,33 @@ fn move_slash_selection(form: &mut EditForm, delta: i32) {
 
 /// Replaces `/query` (the triggering `/` through the current cursor) with
 /// the highlighted match's snippet, and positions the cursor within it.
-fn apply_slash_command(form: &mut EditForm) {
-    let Some(existing) = &form.slash_menu else { return };
+/// Returns `false` (menu left untouched) if nothing matches the typed
+/// query — the caller decides what a "confirm" keystroke should do then
+/// (see `close_slash_menu_with_newline`).
+fn apply_slash_command(form: &mut EditForm) -> bool {
+    let Some(existing) = &form.slash_menu else { return false };
     let matches = slash::matching(&existing.query);
     let Some(cmd) = matches.get(existing.selected).or_else(|| matches.first()).copied() else {
-        // No match for the typed query: leave the menu open (Enter is a
-        // no-op) rather than closing it on a keystroke that inserted nothing.
-        return;
+        return false;
     };
     let menu = form.slash_menu.take().expect("checked Some above");
     insert_slash_command(form, &menu, cmd);
+    true
+}
+
+/// Closes the `/` menu without applying a command and inserts a plain
+/// newline at the query's end, so an Enter that matched nothing (e.g. the
+/// user typed a `/etc/hosts`-style path rather than a command) still behaves
+/// like a normal newline instead of silently vanishing — we've already
+/// stolen that Enter keystroke from the body `TextEdit`.
+fn close_slash_menu_with_newline(form: &mut EditForm) {
+    let Some(menu) = form.slash_menu.take() else { return };
+    let mut chars: Vec<char> = form.body.chars().collect();
+    let pos = (menu.query_start + menu.query.chars().count()).min(chars.len());
+    chars.insert(pos, '\n');
+    form.body = chars.into_iter().collect();
+    form.cursor = pos + 1;
+    form.just_entered_insert = true;
 }
 
 /// Like `apply_slash_command`, but for an explicit filtered-list index
