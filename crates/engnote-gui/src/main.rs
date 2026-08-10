@@ -1,4 +1,5 @@
 mod markdown;
+mod slash;
 mod theme;
 mod vim;
 
@@ -168,6 +169,22 @@ struct EditForm {
     just_entered_insert: bool,
     pending_g: bool,
     pending_d: bool,
+    /// `Some` while the `/` command menu (Notion-style block insertion) is
+    /// open over the body field — see `update_slash_menu`.
+    slash_menu: Option<SlashMenu>,
+}
+
+/// State for the `/` command menu: which query it's currently filtering on
+/// and which of the filtered matches is highlighted.
+struct SlashMenu {
+    /// Char index into `body` right after the triggering `/`, i.e. where the
+    /// typed filter query starts.
+    query_start: usize,
+    /// Text typed after `/` so far, used to filter `slash::COMMANDS`.
+    query: String,
+    /// Index into the *filtered* match list (`slash::matching(&query)`), not
+    /// into `slash::COMMANDS` itself.
+    selected: usize,
 }
 
 impl EditForm {
@@ -188,6 +205,7 @@ impl EditForm {
             just_entered_insert: false,
             pending_g: false,
             pending_d: false,
+            slash_menu: None,
         }
     }
 
@@ -207,6 +225,7 @@ impl EditForm {
             just_entered_insert: false,
             pending_g: false,
             pending_d: false,
+            slash_menu: None,
         }
     }
 
@@ -234,6 +253,7 @@ impl EditForm {
             (Body, false) => Tags,
         };
         self.clamp_cursor();
+        self.slash_menu = None;
     }
 
     /// `j`/`k` between Title/Tags only (Body has real vertical motion, and
@@ -249,6 +269,7 @@ impl EditForm {
             (other, _) => other,
         };
         self.clamp_cursor();
+        self.slash_menu = None;
     }
 
     fn into_note(self, context_path: Option<String>) -> Note {
@@ -461,7 +482,28 @@ impl App {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
                 intent = Intent::Save;
             } else if form.editor_mode == vim::EditorMode::Insert {
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if form.active_field == ActiveField::Body && form.slash_menu.is_some() {
+                    // The `/` menu is open: steal Up/Down/Enter/Escape from the
+                    // live body `TextEdit` (which would otherwise move its real
+                    // cursor or insert a newline) to drive the menu instead.
+                    // Everything else (ordinary typing) still falls through to
+                    // the `TextEdit` below, which is what keeps the query text
+                    // in sync as the user types.
+                    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        form.slash_menu = None;
+                    } else if ctx
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown))
+                    {
+                        move_slash_selection(form, 1);
+                    } else if ctx
+                        .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp))
+                    {
+                        move_slash_selection(form, -1);
+                    } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+                    {
+                        apply_slash_command(form);
+                    }
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     let field_id = form.active_field.id();
                     if let Some(range) = egui::text_edit::TextEditState::load(ctx, field_id)
                         .and_then(|state| state.cursor.char_range())
@@ -520,6 +562,170 @@ impl App {
             Intent::None => {}
         }
     }
+}
+
+/// Re-derives `slash_menu`'s open/closed state and filter query from the
+/// live cursor position; called every frame the body field is shown in
+/// Insert mode (see `main.rs`'s body-editing block). Notion-style trigger:
+/// only fires when `/` is the very first character of the current line (not,
+/// say, inside a URL pasted into the body), and only while nothing after it
+/// is whitespace — finishing the query with a space just types a literal
+/// space and closes the menu, as in most editors.
+fn update_slash_menu(body: &str, cursor: Option<usize>, slash_menu: &mut Option<SlashMenu>) {
+    let Some(cursor) = cursor else {
+        *slash_menu = None;
+        return;
+    };
+    let chars: Vec<char> = body.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let line_start = chars[..cursor]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line_prefix: String = chars[line_start..cursor].iter().collect();
+    let query = match line_prefix.strip_prefix('/') {
+        Some(q) if !q.chars().any(char::is_whitespace) => q,
+        _ => {
+            *slash_menu = None;
+            return;
+        }
+    };
+    let query_start = line_start + 1;
+    let match_count = slash::matching(query).len();
+    let selected = match slash_menu {
+        Some(menu) if menu.query_start == query_start => menu.selected,
+        _ => 0,
+    }
+    .min(match_count.saturating_sub(1));
+    *slash_menu = Some(SlashMenu { query_start, query: query.to_string(), selected });
+}
+
+/// Moves the highlighted match up/down (wrapping), clamped to however many
+/// commands currently match the typed query.
+fn move_slash_selection(form: &mut EditForm, delta: i32) {
+    let Some(menu) = &mut form.slash_menu else { return };
+    let count = slash::matching(&menu.query).len();
+    if count == 0 {
+        return;
+    }
+    menu.selected = (menu.selected as i32 + delta).rem_euclid(count as i32) as usize;
+}
+
+/// Replaces `/query` (the triggering `/` through the current cursor) with
+/// the highlighted match's snippet, and positions the cursor within it.
+fn apply_slash_command(form: &mut EditForm) {
+    let Some(existing) = &form.slash_menu else { return };
+    let matches = slash::matching(&existing.query);
+    let Some(cmd) = matches.get(existing.selected).or_else(|| matches.first()).copied() else {
+        // No match for the typed query: leave the menu open (Enter is a
+        // no-op) rather than closing it on a keystroke that inserted nothing.
+        return;
+    };
+    let menu = form.slash_menu.take().expect("checked Some above");
+    insert_slash_command(form, &menu, cmd);
+}
+
+/// Like `apply_slash_command`, but for an explicit filtered-list index
+/// (used when a menu item is clicked rather than confirmed with Enter).
+fn apply_slash_command_at(form: &mut EditForm, index: usize) {
+    let Some(menu) = form.slash_menu.take() else { return };
+    let matches = slash::matching(&menu.query);
+    let Some(cmd) = matches.get(index) else { return };
+    insert_slash_command(form, &menu, cmd);
+}
+
+fn insert_slash_command(form: &mut EditForm, menu: &SlashMenu, cmd: &slash::SlashCommand) {
+    let mut chars: Vec<char> = form.body.chars().collect();
+    let replace_start = menu.query_start - 1; // include the leading '/'
+    let replace_end = (menu.query_start + menu.query.chars().count()).min(chars.len());
+    chars.splice(replace_start..replace_end, cmd.insert.chars());
+    form.body = chars.into_iter().collect();
+    form.cursor = replace_start + cmd.cursor_offset;
+    // Reuse the same mechanism vim Insert-mode entry uses to hand the live
+    // `TextEdit` a specific cursor position next frame (see `main.rs`'s body
+    // rendering block).
+    form.just_entered_insert = true;
+}
+
+/// Renders the `/` command popup near the text cursor; returns the filtered
+/// index of a clicked item, if any. Returns rather than applies directly
+/// because the body `TextEdit` shown just above still owns the only mutable
+/// borrow of `form.body`/`form.cursor` this frame — the caller applies it
+/// once that borrow has ended.
+fn show_slash_menu(
+    ui: &mut egui::Ui,
+    galley: &egui::Galley,
+    galley_pos: egui::Pos2,
+    menu: &SlashMenu,
+) -> Option<usize> {
+    let cursor_idx = menu.query_start + menu.query.chars().count();
+    let cursor_rect = galley
+        .pos_from_cursor(egui::text::CCursor::new(cursor_idx))
+        .translate(galley_pos.to_vec2());
+    let pos = egui::pos2(cursor_rect.left(), cursor_rect.bottom() + 4.0);
+
+    let matches = slash::matching(&menu.query);
+    let mut clicked = None;
+    egui::Area::new(egui::Id::new("engnote-slash-menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD_BG)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.set_width(220.0);
+                    if matches.is_empty() {
+                        ui.label(
+                            egui::RichText::new("一致するコマンドなし")
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                        return;
+                    }
+                    for (i, cmd) in matches.iter().enumerate() {
+                        let bg = if i == menu.selected {
+                            theme::ACCENT.gamma_multiply(0.25)
+                        } else {
+                            egui::Color32::TRANSPARENT
+                        };
+                        let resp = egui::Frame::new()
+                            .fill(bg)
+                            .corner_radius(egui::CornerRadius::same(5))
+                            .inner_margin(egui::Margin::symmetric(8, 4))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(cmd.label).color(theme::TEXT).strong(),
+                                    );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                egui::RichText::new(cmd.hint)
+                                                    .small()
+                                                    .monospace()
+                                                    .color(theme::TEXT_DIM),
+                                            );
+                                        },
+                                    );
+                                });
+                            })
+                            .response
+                            .interact(egui::Sense::click());
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+        });
+    clicked
 }
 
 /// Single-character text-input events for this frame (i.e. actual typed
@@ -987,6 +1193,7 @@ impl eframe::App for App {
                                 ) {
                                     form.active_field = ActiveField::Title;
                                     form.clamp_cursor();
+                                    form.slash_menu = None;
                                 }
                                 ui.add_space(10.0);
 
@@ -1006,6 +1213,7 @@ impl eframe::App for App {
                                 ) {
                                     form.active_field = ActiveField::Tags;
                                     form.clamp_cursor();
+                                    form.slash_menu = None;
                                 }
                                 ui.add_space(16.0);
 
@@ -1058,7 +1266,7 @@ impl eframe::App for App {
                                                                 .desired_rows(body_rows)
                                                                 .desired_width(f32::INFINITY)
                                                                 .show(ui);
-                                                            if form.just_entered_insert {
+                                                            let live_cursor = if form.just_entered_insert {
                                                                 output.state.cursor.set_char_range(Some(
                                                                     egui::text::CCursorRange::one(
                                                                         egui::text::CCursor::new(form.cursor),
@@ -1067,6 +1275,20 @@ impl eframe::App for App {
                                                                 output.state.store(ui.ctx(), body_id);
                                                                 output.response.request_focus();
                                                                 form.just_entered_insert = false;
+                                                                Some(form.cursor)
+                                                            } else {
+                                                                output.cursor_range.map(|r| r.primary.index)
+                                                            };
+                                                            update_slash_menu(
+                                                                &form.body,
+                                                                live_cursor,
+                                                                &mut form.slash_menu,
+                                                            );
+                                                            let clicked = form.slash_menu.as_ref().and_then(|menu| {
+                                                                show_slash_menu(ui, &output.galley, output.galley_pos, menu)
+                                                            });
+                                                            if let Some(idx) = clicked {
+                                                                apply_slash_command_at(form, idx);
                                                             }
                                                         }
                                                         vim::EditorMode::Normal => {
