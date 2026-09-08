@@ -1,4 +1,6 @@
 mod markdown;
+mod quick_open;
+mod tabs;
 mod theme;
 mod vim;
 
@@ -8,6 +10,7 @@ use chrono::Local;
 use eframe::egui;
 use engnote_core::note::Note;
 use engnote_core::vault;
+use tabs::{TabContent, Tabs};
 
 /// Id of the sidebar filter `TextEdit`, so global key handling can tell
 /// whether it currently has focus (and can request/surrender that focus).
@@ -120,11 +123,6 @@ fn install_japanese_font(ctx: &egui::Context) {
             .push("japanese".to_owned());
     }
     ctx.set_fonts(fonts);
-}
-
-enum Mode {
-    Viewing,
-    Editing(EditForm),
 }
 
 /// Which field of the edit form vim motions currently apply to.
@@ -273,13 +271,17 @@ impl EditForm {
 struct App {
     vault_dir: PathBuf,
     notes: Vec<(PathBuf, Note)>,
-    selected: Option<usize>,
+    tabs: Tabs,
     filter: String,
-    mode: Mode,
     error: Option<String>,
     dock_icon_set: bool,
     /// `Some(buffer)` while the `:command` line (opened with `:`) is active.
     command_input: Option<String>,
+    /// `Some(state)` while the Cmd+P quick-open palette is on screen.
+    quick_open: Option<quick_open::QuickOpen>,
+    /// Id of the tab currently being click-dragged in the tab bar, if any
+    /// (see `tabs::render_bar`).
+    drag_tab: Option<u64>,
 }
 
 impl App {
@@ -287,29 +289,58 @@ impl App {
         let mut app = App {
             vault_dir,
             notes: Vec::new(),
-            selected: None,
+            tabs: Tabs::new(),
             filter: String::new(),
-            mode: Mode::Viewing,
             error: None,
             dock_icon_set: false,
             command_input: None,
+            quick_open: None,
+            drag_tab: None,
         };
         app.reload();
         app
     }
 
+    fn note_index_by_id(&self, id: &str) -> Option<usize> {
+        self.notes.iter().position(|(_, n)| n.frontmatter.id == id)
+    }
+
+    /// Reloads the note list from disk and remaps every tab currently
+    /// `Viewing` a note so it still points at the right note afterward (the
+    /// reload can reorder/insert/remove entries in `self.notes`). Tabs mid-
+    /// edit are untouched — an `EditForm` carries its own note id, not an
+    /// index into `self.notes`.
     fn reload(&mut self) {
+        let viewing: Vec<(usize, String)> = self
+            .tabs
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| match &t.content {
+                TabContent::Viewing(idx) => Some((i, self.notes[*idx].1.frontmatter.id.clone())),
+                _ => None,
+            })
+            .collect();
+
         match vault::list(&self.vault_dir) {
             Ok(notes) => self.notes = notes,
-            Err(e) => self.error = Some(format!("ノート一覧の読み込みに失敗: {e:#}")),
+            Err(e) => {
+                self.error = Some(format!("ノート一覧の読み込みに失敗: {e:#}"));
+                return;
+            }
+        }
+
+        for (tab_idx, id) in viewing {
+            self.tabs.items[tab_idx].content = match self.note_index_by_id(&id) {
+                Some(idx) => TabContent::Viewing(idx),
+                None => TabContent::Empty, // the note was deleted out from under this tab
+            };
         }
     }
 
-    fn select_by_id(&mut self, id: &str) {
-        self.selected = self.notes.iter().position(|(_, n)| n.frontmatter.id == id);
-    }
-
-    fn save_edit(&mut self, form: EditForm) {
+    /// Saves the `EditForm` that was in tab `tab_idx`, then points that tab
+    /// back at the (possibly newly created) note.
+    fn save_edit(&mut self, tab_idx: usize, form: EditForm) {
         let existing_context = form
             .path
             .as_ref()
@@ -317,7 +348,7 @@ impl App {
             .and_then(|(_, n)| n.frontmatter.context_path.clone());
         let id = form.id.clone();
         let note = form.into_note(existing_context);
-        let result = match &self
+        let result = match self
             .notes
             .iter()
             .find(|(_, n)| n.frontmatter.id == note.frontmatter.id)
@@ -328,16 +359,18 @@ impl App {
         match result {
             Ok(_) => {
                 self.reload();
-                self.select_by_id(&id);
-                self.mode = Mode::Viewing;
                 self.error = None;
+                self.tabs.items[tab_idx].content = match self.note_index_by_id(&id) {
+                    Some(idx) => TabContent::Viewing(idx),
+                    None => TabContent::Empty,
+                };
             }
             Err(e) => self.error = Some(format!("保存に失敗: {e:#}")),
         }
     }
 
-    /// Moves `self.selected` up/down by one within the currently filtered
-    /// note list (`j`/`k`).
+    /// Moves the active tab's `Viewing` note up/down by one within the
+    /// currently filtered note list (`j`/`k`).
     fn select_relative(&mut self, delta: i32) {
         let filter = self.filter.to_lowercase();
         let visible: Vec<usize> = self
@@ -354,18 +387,51 @@ impl App {
         if visible.is_empty() {
             return;
         }
-        let current = self.selected.and_then(|s| visible.iter().position(|&i| i == s));
+        let current = match self.tabs.active_tab().content {
+            TabContent::Viewing(idx) => visible.iter().position(|&i| i == idx),
+            _ => None,
+        };
         let next = match current {
             Some(p) => (p as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize,
             None => 0,
         };
-        self.selected = Some(visible[next]);
+        self.tabs.open_here(TabContent::Viewing(visible[next]));
     }
 
-    /// App-wide vim-style keyboard shortcuts. Skipped whenever some other
-    /// widget (a plain text field) currently wants the keyboard, so normal
-    /// typing in the title/tags/filter fields is unaffected.
+    /// App-wide vim-style keyboard shortcuts, plus the browser-style tab
+    /// shortcuts (Ctrl+H/L, Cmd+P/T/W). The tab shortcuts are checked first
+    /// and consumed via `consume_key` so they win regardless of which text
+    /// field currently has focus — same idea as the existing Cmd+S save
+    /// shortcut in `handle_editing_keys`.
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
+        if self.quick_open.is_some() {
+            // Its own key handling (arrows/Enter/Esc) happens in
+            // `quick_open::render` during the UI pass below.
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::P)) {
+            self.quick_open = Some(quick_open::QuickOpen::new());
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::T)) {
+            self.tabs.new_empty_tab();
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
+            let idx = self.tabs.active_index();
+            self.tabs.close(idx);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H)) {
+            self.tabs.select_relative(-1);
+            return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
+            self.tabs.select_relative(1);
+            return;
+        }
+
         let filter_id = egui::Id::new(FILTER_ID);
         if ctx.memory(|m| m.focused()) == Some(filter_id) {
             if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -389,7 +455,7 @@ impl App {
             return;
         }
 
-        if matches!(self.mode, Mode::Editing(_)) {
+        if matches!(self.tabs.active_tab().content, TabContent::Editing(_)) {
             self.handle_editing_keys(ctx);
         } else {
             self.handle_viewing_keys(ctx, filter_id);
@@ -400,12 +466,16 @@ impl App {
     fn execute_command(&mut self, cmd: &str) {
         match cmd.trim() {
             "e" | "new" | "enew" => {
-                self.mode = Mode::Editing(EditForm::blank());
-                self.selected = None;
+                self.tabs.open_here(TabContent::Editing(EditForm::blank()));
             }
             "w" | "wq" | "x" => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
-                    self.save_edit(form);
+                let tab_idx = self.tabs.active_index();
+                if let TabContent::Editing(_) = self.tabs.items[tab_idx].content {
+                    if let TabContent::Editing(form) =
+                        std::mem::replace(&mut self.tabs.items[tab_idx].content, TabContent::Empty)
+                    {
+                        self.save_edit(tab_idx, form);
+                    }
                 }
             }
             _ => {}
@@ -421,15 +491,14 @@ impl App {
                 'j' => self.select_relative(1),
                 'k' => self.select_relative(-1),
                 'n' => {
-                    self.mode = Mode::Editing(EditForm::blank());
-                    self.selected = None;
+                    self.tabs.open_here(TabContent::Editing(EditForm::blank()));
                     return;
                 }
                 'e' | 'i' => {
-                    if let Some(idx) = self.selected {
+                    if let TabContent::Viewing(idx) = self.tabs.active_tab().content {
                         let path = self.notes[idx].0.clone();
                         let note = self.notes[idx].1.clone();
-                        self.mode = Mode::Editing(EditForm::from_note(path, &note));
+                        self.tabs.open_here(TabContent::Editing(EditForm::from_note(path, &note)));
                         return;
                     }
                 }
@@ -452,8 +521,9 @@ impl App {
             Save,
         }
         let mut intent = Intent::None;
+        let tab_idx = self.tabs.active_index();
 
-        if let Mode::Editing(form) = &mut self.mode {
+        if let TabContent::Editing(form) = &mut self.tabs.items[tab_idx].content {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
                 intent = Intent::Save;
             } else if form.active_field == ActiveField::Body
@@ -515,10 +585,23 @@ impl App {
         }
 
         match intent {
-            Intent::ExitToViewing => self.mode = Mode::Viewing,
+            Intent::ExitToViewing => {
+                let back = match &self.tabs.items[tab_idx].content {
+                    TabContent::Editing(form) => {
+                        form.path.as_ref().and_then(|p| self.notes.iter().position(|(np, _)| np == p))
+                    }
+                    _ => None,
+                };
+                self.tabs.items[tab_idx].content = match back {
+                    Some(idx) => TabContent::Viewing(idx),
+                    None => TabContent::Empty,
+                };
+            }
             Intent::Save => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
-                    self.save_edit(form);
+                if let TabContent::Editing(form) =
+                    std::mem::replace(&mut self.tabs.items[tab_idx].content, TabContent::Empty)
+                {
+                    self.save_edit(tab_idx, form);
                 }
             }
             Intent::None => {}
@@ -646,8 +729,10 @@ enum GuiAction {
     StartEdit(EditForm),
     Save,
     Cancel,
-    /// Jump to another note by index (clicking an outgoing link/backlink).
-    SelectNote(usize),
+    /// Jump to another note by index (clicking an outgoing link/backlink, or
+    /// a sidebar card). `new_tab` mirrors the Cmd+click "open in new tab"
+    /// convention used elsewhere (quick open, tab bar).
+    SelectNote { index: usize, new_tab: bool },
     /// Flip a `[ ]`/`[x]` task checkbox clicked in the body view and persist it.
     ToggleCheckbox {
         index: usize,
@@ -807,6 +892,10 @@ impl eframe::App for App {
 
         let mut action: Option<GuiAction> = None;
 
+        if let Some(bar_action) = tabs::render_bar(ctx, &self.tabs, &self.notes, &mut self.drag_tab) {
+            self.tabs.apply(bar_action);
+        }
+
         if let Some(err) = &self.error {
             egui::TopBottomPanel::top("error")
                 .frame(
@@ -840,7 +929,7 @@ impl eframe::App for App {
                             response.request_focus();
                         }
                     });
-                } else if let Mode::Editing(form) = &self.mode {
+                } else if let TabContent::Editing(form) = &self.tabs.active_tab().content {
                     let (text, color) = match form.editor_mode {
                         vim::EditorMode::Normal => ("-- NORMAL --", theme::TEXT_DIM),
                         vim::EditorMode::Insert => ("-- INSERT --", theme::GREEN),
@@ -848,9 +937,11 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new(text).monospace().strong().color(color));
                 } else {
                     ui.label(
-                        egui::RichText::new("j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド")
-                            .small()
-                            .color(theme::TEXT_DIM),
+                        egui::RichText::new(
+                            "j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド ・ ⌃H/⌃L タブ移動 ・ ⌘P 開く ・ ⌘T 新規タブ",
+                        )
+                        .small()
+                        .color(theme::TEXT_DIM),
                     );
                 }
             });
@@ -882,6 +973,11 @@ impl eframe::App for App {
                 ui.separator();
                 ui.add_space(8.0);
 
+                let active_viewing = match self.tabs.active_tab().content {
+                    TabContent::Viewing(idx) => Some(idx),
+                    _ => None,
+                };
+
                 let filter = self.filter.to_lowercase();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for (i, (_, note)) in self.notes.iter().enumerate() {
@@ -895,153 +991,24 @@ impl eframe::App for App {
                         if !matches {
                             continue;
                         }
-                        if note_card(ui, note, self.selected == Some(i)).clicked() {
-                            self.selected = Some(i);
-                            self.mode = Mode::Viewing;
+                        let resp = note_card(ui, note, active_viewing == Some(i));
+                        if resp.clicked() {
+                            let new_tab = ui.input(|inp| inp.modifiers.command);
+                            action = Some(GuiAction::SelectNote { index: i, new_tab });
                         }
                         ui.add_space(6.0);
                     }
                 });
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| match &mut self.mode {
-            Mode::Viewing => {
-                if let Some(i) = self.selected {
-                    let (path, note) = &self.notes[i];
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let tab_idx = self.tabs.active_index();
+            let is_editing = matches!(self.tabs.items[tab_idx].content, TabContent::Editing(_));
 
-                    let mut outgoing: Vec<(usize, String)> = Vec::new();
-                    for link_text in engnote_core::linking::extract_links(&note.body) {
-                        if let engnote_core::linking::LinkTarget::Resolved(id) =
-                            engnote_core::linking::resolve_link(&self.notes, link_text)
-                        {
-                            if let Some(idx) = self.notes.iter().position(|(_, n)| n.frontmatter.id == id) {
-                                if idx != i && !outgoing.iter().any(|(oi, _)| *oi == idx) {
-                                    outgoing.push((idx, self.notes[idx].1.frontmatter.title.clone()));
-                                }
-                            }
-                        }
-                    }
-                    let backlinks: Vec<(usize, String)> = engnote_core::linking::backlinks(
-                        &self.notes,
-                        &note.frontmatter.id,
-                    )
-                    .iter()
-                    .filter_map(|n| {
-                        self.notes
-                            .iter()
-                            .position(|(_, x)| x.frontmatter.id == n.frontmatter.id)
-                            .map(|idx| (idx, n.frontmatter.title.clone()))
-                    })
-                    .collect();
-
-                    egui::ScrollArea::vertical()
-                        .id_salt("view-scroll")
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            egui::Frame::new()
-                                .inner_margin(egui::Margin::symmetric(28, 24))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.heading(if note.frontmatter.title.is_empty() {
-                                            "(無題)"
-                                        } else {
-                                            note.frontmatter.title.as_str()
-                                        });
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.button("編集").clicked() {
-                                                    action = Some(GuiAction::StartEdit(
-                                                        EditForm::from_note(path.clone(), note),
-                                                    ));
-                                                }
-                                            },
-                                        );
-                                    });
-
-                                    if !note.frontmatter.tags.is_empty() {
-                                        ui.add_space(6.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            for t in &note.frontmatter.tags {
-                                                theme::badge(ui, t, theme::TEXT_DIM);
-                                            }
-                                        });
-                                    }
-
-                                    ui.add_space(6.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "作成 {}    更新 {}",
-                                            note.frontmatter.created.format("%Y-%m-%d %H:%M"),
-                                            note.frontmatter.updated.format("%Y-%m-%d %H:%M"),
-                                        ))
-                                        .small()
-                                        .color(theme::TEXT_DIM),
-                                    );
-
-                                    ui.add_space(16.0);
-                                    egui::Frame::new()
-                                        .fill(theme::CARD_BG)
-                                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                                        .corner_radius(egui::CornerRadius::same(10))
-                                        .inner_margin(egui::Margin::same(18))
-                                        .show(ui, |ui| {
-                                            ui.set_width(ui.available_width());
-                                            let toggled = markdown::render_interactive(
-                                                ui,
-                                                &note.body,
-                                                &markdown::Palette {
-                                                    text: theme::TEXT,
-                                                    dim: theme::TEXT_DIM,
-                                                    strong: egui::Color32::WHITE,
-                                                    code_bg: theme::BG,
-                                                },
-                                            );
-                                            if let Some(marker_range) = toggled {
-                                                action = Some(GuiAction::ToggleCheckbox {
-                                                    index: i,
-                                                    marker_range,
-                                                });
-                                            }
-                                        });
-
-                                    if !outgoing.is_empty() {
-                                        ui.add_space(14.0);
-                                        ui.label(
-                                            egui::RichText::new("リンク").small().color(theme::TEXT_DIM),
-                                        );
-                                        ui.add_space(4.0);
-                                        if let Some(idx) = link_row(ui, &outgoing) {
-                                            action = Some(GuiAction::SelectNote(idx));
-                                        }
-                                    }
-
-                                    if !backlinks.is_empty() {
-                                        ui.add_space(14.0);
-                                        ui.label(
-                                            egui::RichText::new("バックリンク")
-                                                .small()
-                                                .color(theme::TEXT_DIM),
-                                        );
-                                        ui.add_space(4.0);
-                                        if let Some(idx) = link_row(ui, &backlinks) {
-                                            action = Some(GuiAction::SelectNote(idx));
-                                        }
-                                    }
-                                });
-                        });
-                } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "左の一覧からノートを選ぶか、「＋ 新規ノート」で作成してください",
-                            )
-                            .color(theme::TEXT_DIM),
-                        );
-                    });
-                }
-            }
-            Mode::Editing(form) => {
+            if is_editing {
+                let TabContent::Editing(form) = &mut self.tabs.items[tab_idx].content else {
+                    unreachable!()
+                };
                 egui::ScrollArea::vertical()
                     .id_salt("edit-scroll")
                     .auto_shrink([false, false])
@@ -1188,24 +1155,198 @@ impl eframe::App for App {
                                 });
                             });
                     });
+                return;
+            }
+
+            match self.tabs.items[tab_idx].content {
+                TabContent::Viewing(i) => {
+                    let (path, note) = &self.notes[i];
+
+                    let mut outgoing: Vec<(usize, String)> = Vec::new();
+                    for link_text in engnote_core::linking::extract_links(&note.body) {
+                        if let engnote_core::linking::LinkTarget::Resolved(id) =
+                            engnote_core::linking::resolve_link(&self.notes, link_text)
+                        {
+                            if let Some(idx) = self.notes.iter().position(|(_, n)| n.frontmatter.id == id) {
+                                if idx != i && !outgoing.iter().any(|(oi, _)| *oi == idx) {
+                                    outgoing.push((idx, self.notes[idx].1.frontmatter.title.clone()));
+                                }
+                            }
+                        }
+                    }
+                    let backlinks: Vec<(usize, String)> = engnote_core::linking::backlinks(
+                        &self.notes,
+                        &note.frontmatter.id,
+                    )
+                    .iter()
+                    .filter_map(|n| {
+                        self.notes
+                            .iter()
+                            .position(|(_, x)| x.frontmatter.id == n.frontmatter.id)
+                            .map(|idx| (idx, n.frontmatter.title.clone()))
+                    })
+                    .collect();
+
+                    egui::ScrollArea::vertical()
+                        .id_salt("view-scroll")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(28, 24))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.heading(if note.frontmatter.title.is_empty() {
+                                            "(無題)"
+                                        } else {
+                                            note.frontmatter.title.as_str()
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui.button("編集").clicked() {
+                                                    action = Some(GuiAction::StartEdit(
+                                                        EditForm::from_note(path.clone(), note),
+                                                    ));
+                                                }
+                                            },
+                                        );
+                                    });
+
+                                    if !note.frontmatter.tags.is_empty() {
+                                        ui.add_space(6.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            for t in &note.frontmatter.tags {
+                                                theme::badge(ui, t, theme::TEXT_DIM);
+                                            }
+                                        });
+                                    }
+
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "作成 {}    更新 {}",
+                                            note.frontmatter.created.format("%Y-%m-%d %H:%M"),
+                                            note.frontmatter.updated.format("%Y-%m-%d %H:%M"),
+                                        ))
+                                        .small()
+                                        .color(theme::TEXT_DIM),
+                                    );
+
+                                    ui.add_space(16.0);
+                                    egui::Frame::new()
+                                        .fill(theme::CARD_BG)
+                                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                        .corner_radius(egui::CornerRadius::same(10))
+                                        .inner_margin(egui::Margin::same(18))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            let toggled = markdown::render_interactive(
+                                                ui,
+                                                &note.body,
+                                                &markdown::Palette {
+                                                    text: theme::TEXT,
+                                                    dim: theme::TEXT_DIM,
+                                                    strong: egui::Color32::WHITE,
+                                                    code_bg: theme::BG,
+                                                },
+                                            );
+                                            if let Some(marker_range) = toggled {
+                                                action = Some(GuiAction::ToggleCheckbox {
+                                                    index: i,
+                                                    marker_range,
+                                                });
+                                            }
+                                        });
+
+                                    if !outgoing.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            egui::RichText::new("リンク").small().color(theme::TEXT_DIM),
+                                        );
+                                        ui.add_space(4.0);
+                                        if let Some(idx) = link_row(ui, &outgoing) {
+                                            let new_tab = ui.input(|inp| inp.modifiers.command);
+                                            action = Some(GuiAction::SelectNote { index: idx, new_tab });
+                                        }
+                                    }
+
+                                    if !backlinks.is_empty() {
+                                        ui.add_space(14.0);
+                                        ui.label(
+                                            egui::RichText::new("バックリンク")
+                                                .small()
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                        ui.add_space(4.0);
+                                        if let Some(idx) = link_row(ui, &backlinks) {
+                                            let new_tab = ui.input(|inp| inp.modifiers.command);
+                                            action = Some(GuiAction::SelectNote { index: idx, new_tab });
+                                        }
+                                    }
+                                });
+                        });
+                }
+                TabContent::Empty => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "左の一覧からノートを選ぶか、「＋ 新規ノート」で作成、または ⌘P でノートを開いてください",
+                            )
+                            .color(theme::TEXT_DIM),
+                        );
+                    });
+                }
+                TabContent::Editing(_) => unreachable!(),
             }
         });
 
+        if let Some(qo) = &mut self.quick_open {
+            match quick_open::render(ctx, qo, &self.notes) {
+                Some(quick_open::Action::Open(idx)) => {
+                    self.tabs.open_here(TabContent::Viewing(idx));
+                    self.quick_open = None;
+                }
+                Some(quick_open::Action::OpenInNewTab(idx)) => {
+                    self.tabs.open_new(TabContent::Viewing(idx));
+                    self.quick_open = None;
+                }
+                Some(quick_open::Action::Cancel) => self.quick_open = None,
+                None => {}
+            }
+        }
+
         match action {
             Some(GuiAction::StartNew) => {
-                self.mode = Mode::Editing(EditForm::blank());
-                self.selected = None;
+                self.tabs.open_here(TabContent::Editing(EditForm::blank()));
             }
-            Some(GuiAction::StartEdit(form)) => self.mode = Mode::Editing(form),
+            Some(GuiAction::StartEdit(form)) => self.tabs.open_here(TabContent::Editing(form)),
             Some(GuiAction::Save) => {
-                if let Mode::Editing(form) = std::mem::replace(&mut self.mode, Mode::Viewing) {
-                    self.save_edit(form);
+                let tab_idx = self.tabs.active_index();
+                if let TabContent::Editing(form) =
+                    std::mem::replace(&mut self.tabs.items[tab_idx].content, TabContent::Empty)
+                {
+                    self.save_edit(tab_idx, form);
                 }
             }
-            Some(GuiAction::Cancel) => self.mode = Mode::Viewing,
-            Some(GuiAction::SelectNote(i)) => {
-                self.selected = Some(i);
-                self.mode = Mode::Viewing;
+            Some(GuiAction::Cancel) => {
+                let tab_idx = self.tabs.active_index();
+                let back = match &self.tabs.items[tab_idx].content {
+                    TabContent::Editing(form) => {
+                        form.path.as_ref().and_then(|p| self.notes.iter().position(|(np, _)| np == p))
+                    }
+                    _ => None,
+                };
+                self.tabs.items[tab_idx].content = match back {
+                    Some(idx) => TabContent::Viewing(idx),
+                    None => TabContent::Empty,
+                };
+            }
+            Some(GuiAction::SelectNote { index, new_tab }) => {
+                if new_tab {
+                    self.tabs.open_new(TabContent::Viewing(index));
+                } else {
+                    self.tabs.open_here(TabContent::Viewing(index));
+                }
             }
             Some(GuiAction::ToggleCheckbox { index, marker_range }) => {
                 let (path, note) = &self.notes[index];
@@ -1220,7 +1361,10 @@ impl eframe::App for App {
                     Ok(()) => {
                         let id = updated.frontmatter.id.clone();
                         self.reload();
-                        self.select_by_id(&id);
+                        let tab_idx = self.tabs.active_index();
+                        if let Some(idx) = self.note_index_by_id(&id) {
+                            self.tabs.items[tab_idx].content = TabContent::Viewing(idx);
+                        }
                     }
                     Err(e) => self.error = Some(format!("チェック状態の保存に失敗: {e:#}")),
                 }
