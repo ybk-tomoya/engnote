@@ -2,4 +2,4 @@ pub mod linking;
 pub mod note;
 pub mod vault;
 
-pub use note::{Note, Status};
+pub use note::Note;

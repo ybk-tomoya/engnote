@@ -1,32 +1,12 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Draft,
-    Active,
-    Archived,
-}
-
-impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Status::Draft => "draft",
-            Status::Active => "active",
-            Status::Archived => "archived",
-        };
-        write!(f, "{s}")
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frontmatter {
     pub id: String,
     pub title: String,
-    pub status: Status,
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +28,6 @@ impl Note {
             frontmatter: Frontmatter {
                 id: Ulid::generate().to_string(),
                 title: title.into(),
-                status: Status::Draft,
                 tags: Vec::new(),
                 context_path,
                 created: now,
@@ -106,13 +85,4 @@ fn sanitize_title(title: &str) -> String {
         .collect();
     let trimmed = cleaned.trim();
     trimmed.chars().take(50).collect()
-}
-
-pub fn parse_status(s: &str) -> Result<Status> {
-    match s {
-        "draft" => Ok(Status::Draft),
-        "active" => Ok(Status::Active),
-        "archived" => Ok(Status::Archived),
-        other => bail!("invalid status: {other} (expected draft, active, or archived)"),
-    }
 }

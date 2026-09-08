@@ -1,5 +1,4 @@
 use eframe::egui;
-use engnote_core::note::Status;
 
 pub const BG: egui::Color32 = egui::Color32::from_rgb(13, 13, 15);
 pub const PANEL_BG: egui::Color32 = egui::Color32::from_rgb(19, 19, 22);
@@ -8,14 +7,8 @@ pub const BORDER: egui::Color32 = egui::Color32::from_rgb(42, 42, 48);
 pub const TEXT: egui::Color32 = egui::Color32::from_rgb(230, 230, 236);
 pub const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(142, 142, 152);
 pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(138, 124, 255);
-
-pub fn status_color(status: Status) -> egui::Color32 {
-    match status {
-        Status::Draft => egui::Color32::from_rgb(150, 152, 160),
-        Status::Active => egui::Color32::from_rgb(88, 214, 155),
-        Status::Archived => egui::Color32::from_rgb(214, 163, 88),
-    }
-}
+/// Used for the "-- INSERT --" indicator in the vim status bar.
+pub const GREEN: egui::Color32 = egui::Color32::from_rgb(88, 214, 155);
 
 /// Draws the "engnote" wordmark: a small notepad-style mark (a few
 /// horizontal "lines of text" on an accent square) plus a tracked-out
@@ -59,7 +52,7 @@ pub fn logo(ui: &mut egui::Ui) {
     });
 }
 
-/// A small pill-shaped, colored label (e.g. "draft" / "active" / "archived").
+/// A small pill-shaped, colored label (used for tags).
 pub fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.16))

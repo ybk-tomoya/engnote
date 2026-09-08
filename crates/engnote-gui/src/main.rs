@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use chrono::Local;
 use eframe::egui;
-use engnote_core::note::{Note, Status};
+use engnote_core::note::Note;
 use engnote_core::vault;
 
 /// Id of the sidebar filter `TextEdit`, so global key handling can tell
@@ -153,7 +153,6 @@ struct EditForm {
     title: String,
     tags: String,
     body: String,
-    status: Status,
     /// Which field (`title`/`tags`/`body`) vim motions currently target.
     active_field: ActiveField,
     /// vim-style Normal/Insert mode for the active field (see `vim.rs`).
@@ -180,7 +179,6 @@ impl EditForm {
             title: String::new(),
             tags: String::new(),
             body: String::new(),
-            status: Status::Draft,
             // A brand-new note has nothing to edit yet, so start at the top.
             active_field: ActiveField::Title,
             editor_mode: vim::EditorMode::Normal,
@@ -199,7 +197,6 @@ impl EditForm {
             title: note.frontmatter.title.clone(),
             tags: note.frontmatter.tags.join(", "),
             body: note.body.clone(),
-            status: note.frontmatter.status,
             // Editing an existing note: jump straight to its content.
             active_field: ActiveField::Body,
             editor_mode: vim::EditorMode::Normal,
@@ -263,7 +260,6 @@ impl EditForm {
             frontmatter: engnote_core::note::Frontmatter {
                 id: self.id,
                 title: self.title,
-                status: self.status,
                 tags,
                 context_path,
                 created: self.created,
@@ -680,19 +676,12 @@ fn note_card(ui: &mut egui::Ui, note: &Note, selected: bool) -> egui::Response {
                 note.frontmatter.title.as_str()
             };
             ui.label(egui::RichText::new(title).strong());
-            ui.horizontal(|ui| {
-                theme::badge(
-                    ui,
-                    &note.frontmatter.status.to_string(),
-                    theme::status_color(note.frontmatter.status),
-                );
-                ui.label(
-                    egui::RichText::new(note.short_id())
-                        .monospace()
-                        .size(11.0)
-                        .color(theme::TEXT_DIM),
-                );
-            });
+            ui.label(
+                egui::RichText::new(note.short_id())
+                    .monospace()
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
             if !note.frontmatter.tags.is_empty() {
                 ui.horizontal_wrapped(|ui| {
                     for t in &note.frontmatter.tags {
@@ -854,9 +843,7 @@ impl eframe::App for App {
                 } else if let Mode::Editing(form) = &self.mode {
                     let (text, color) = match form.editor_mode {
                         vim::EditorMode::Normal => ("-- NORMAL --", theme::TEXT_DIM),
-                        vim::EditorMode::Insert => {
-                            ("-- INSERT --", theme::status_color(Status::Active))
-                        }
+                        vim::EditorMode::Insert => ("-- INSERT --", theme::GREEN),
                     };
                     ui.label(egui::RichText::new(text).monospace().strong().color(color));
                 } else {
@@ -960,12 +947,6 @@ impl eframe::App for App {
                                         } else {
                                             note.frontmatter.title.as_str()
                                         });
-                                        ui.add_space(8.0);
-                                        theme::badge(
-                                            ui,
-                                            &note.frontmatter.status.to_string(),
-                                            theme::status_color(note.frontmatter.status),
-                                        );
                                         ui.with_layout(
                                             egui::Layout::right_to_left(egui::Align::Center),
                                             |ui| {

@@ -15,7 +15,6 @@
 ---
 id: 01J8X...                        # ULID、必須・不変
 title: engnoteの設計メモ              # 必須(空文字許容)
-status: draft                       # draft | active | archived、デフォルト draft
 tags: [rust, architecture]          # 任意、デフォルト空配列
 context_path: /Users/.../engnote    # 任意。特定のディレクトリ/ファイルに紐付ける「開いた世界」ノート用
 created: 2026-08-02T15:30:00+09:00  # 必須、自動付与

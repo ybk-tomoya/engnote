@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
-use engnote_core::note::{parse_status, Note};
+use engnote_core::note::Note;
 use engnote_core::vault;
 
 #[derive(Parser)]
@@ -16,7 +16,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Quick capture: save text as a draft note immediately.
+    /// Quick capture: save text as a note immediately.
     Capture {
         text: Vec<String>,
         /// Attach the note to the current directory (context_path).
@@ -37,18 +37,13 @@ enum Command {
     },
     /// List notes.
     List {
-        #[arg(long)]
-        status: Option<String>,
         #[arg(long = "tag")]
         tag: Option<String>,
         #[arg(long, value_hint = clap::ValueHint::AnyPath)]
         context: Option<String>,
     },
     /// List notes whose context_path covers the current directory.
-    Here {
-        #[arg(long)]
-        status: Option<String>,
-    },
+    Here,
     /// Print a note's contents. Omit <ref> to pick interactively.
     Show {
         #[arg(add = ArgValueCompleter::new(complete_note_ref))]
@@ -70,12 +65,6 @@ enum Command {
         note_ref: Option<String>,
         #[command(subcommand)]
         action: TagAction,
-    },
-    /// Change a note's status. `[<ref>] <value>`; omit <ref> to pick interactively.
-    Status {
-        /// `[<ref>] <value>`, e.g. `status active` or `status abc123 active`.
-        #[arg(num_args = 1..=2, add = ArgValueCompleter::new(complete_status_arg))]
-        args: Vec<String>,
     },
 }
 
@@ -99,22 +88,12 @@ fn main() -> Result<()> {
             here,
             context,
         } => new(&vault_dir, title, tags, here, context),
-        Command::List { status, tag, context } => list(&vault_dir, status, tag, context),
-        Command::Here { status } => here(&vault_dir, status),
+        Command::List { tag, context } => list(&vault_dir, tag, context),
+        Command::Here => here(&vault_dir),
         Command::Show { note_ref } => show(&vault_dir, note_ref),
         Command::Edit { note_ref } => edit(&vault_dir, note_ref),
         Command::Rm { note_ref } => rm(&vault_dir, note_ref),
         Command::Tag { note_ref, action } => tag(&vault_dir, note_ref, action),
-        Command::Status { args } => {
-            let (note_ref, value) = match args.len() {
-                1 => (None, args.into_iter().next().unwrap()),
-                _ => {
-                    let mut it = args.into_iter();
-                    (Some(it.next().unwrap()), it.next().unwrap())
-                }
-            };
-            status(&vault_dir, note_ref, &value)
-        }
     }
 }
 
@@ -164,17 +143,10 @@ fn new(
     Ok(())
 }
 
-fn list(
-    vault_dir: &std::path::Path,
-    status: Option<String>,
-    tag: Option<String>,
-    context: Option<String>,
-) -> Result<()> {
-    let status = status.map(|s| parse_status(&s)).transpose()?;
+fn list(vault_dir: &std::path::Path, tag: Option<String>, context: Option<String>) -> Result<()> {
     let notes = vault::list(vault_dir)?;
     for (_, note) in notes.iter().filter(|(_, n)| {
-        status.is_none_or(|s| n.frontmatter.status == s)
-            && tag.as_deref().is_none_or(|t| n.frontmatter.tags.iter().any(|nt| nt == t))
+        tag.as_deref().is_none_or(|t| n.frontmatter.tags.iter().any(|nt| nt == t))
             && context
                 .as_deref()
                 .is_none_or(|c| n.frontmatter.context_path.as_deref() == Some(c))
@@ -184,16 +156,14 @@ fn list(
     Ok(())
 }
 
-fn here(vault_dir: &std::path::Path, status: Option<String>) -> Result<()> {
-    let status = status.map(|s| parse_status(&s)).transpose()?;
+fn here(vault_dir: &std::path::Path) -> Result<()> {
     let cwd = std::env::current_dir().context("reading current directory")?;
     let notes = vault::list(vault_dir)?;
     for (_, note) in notes.iter().filter(|(_, n)| {
-        status.is_none_or(|s| n.frontmatter.status == s)
-            && n.frontmatter
-                .context_path
-                .as_deref()
-                .is_some_and(|ctx| cwd.starts_with(ctx))
+        n.frontmatter
+            .context_path
+            .as_deref()
+            .is_some_and(|ctx| cwd.starts_with(ctx))
     }) {
         print_row(note);
     }
@@ -203,9 +173,8 @@ fn here(vault_dir: &std::path::Path, status: Option<String>) -> Result<()> {
 fn print_row(note: &Note) {
     let tags = note.frontmatter.tags.join(",");
     println!(
-        "{short_id}  {status:<8}  {title}  [{tags}]",
+        "{short_id}  {title}  [{tags}]",
         short_id = note.short_id(),
-        status = note.frontmatter.status.to_string(),
         title = note.frontmatter.title,
     );
 }
@@ -232,8 +201,7 @@ fn complete_note_ref(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         })
         .map(|(_, note)| {
             let help = format!(
-                "{status:<8} {title} [{tags}]",
-                status = note.frontmatter.status,
+                "{title} [{tags}]",
                 title = note.frontmatter.title,
                 tags = note.frontmatter.tags.join(","),
             );
@@ -242,24 +210,8 @@ fn complete_note_ref(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
-/// Completer for `status`'s `[<ref>] <value>` args. clap_complete doesn't
-/// distinguish which of the two slots is being completed for a positional
-/// with `num_args = 1..=2` (`arg_index` is always 0), so this offers note
-/// refs and status literals together regardless of slot.
-fn complete_status_arg(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
-    let mut candidates = complete_note_ref(current);
-    let current_str = current.to_string_lossy();
-    candidates.extend(
-        ["draft", "active", "archived"]
-            .into_iter()
-            .filter(|v| v.starts_with(current_str.as_ref()))
-            .map(CompletionCandidate::new),
-    );
-    candidates
-}
-
 /// Resolves a note by `<ref>`, or, when omitted, lets the user pick one
-/// interactively (fuzzy search over title/status/tags).
+/// interactively (fuzzy search over title/tags).
 fn resolve_note(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result<(std::path::PathBuf, Note)> {
     if let Some(note_ref) = note_ref {
         return vault::find_by_ref(vault_dir, &note_ref);
@@ -273,9 +225,8 @@ fn resolve_note(vault_dir: &std::path::Path, note_ref: Option<String>) -> Result
         .iter()
         .map(|(_, note)| {
             format!(
-                "{short_id}  {status:<8}  {title}  [{tags}]",
+                "{short_id}  {title}  [{tags}]",
                 short_id = note.short_id(),
-                status = note.frontmatter.status,
                 title = note.frontmatter.title,
                 tags = note.frontmatter.tags.join(","),
             )
@@ -338,15 +289,6 @@ fn tag(vault_dir: &std::path::Path, note_ref: Option<String>, action: TagAction)
     note.frontmatter.updated = Local::now();
     vault::save_at(&path, &note)?;
     println!("tags: [{}]", note.frontmatter.tags.join(","));
-    Ok(())
-}
-
-fn status(vault_dir: &std::path::Path, note_ref: Option<String>, value: &str) -> Result<()> {
-    let (path, mut note) = resolve_note(vault_dir, note_ref)?;
-    note.frontmatter.status = parse_status(value)?;
-    note.frontmatter.updated = Local::now();
-    vault::save_at(&path, &note)?;
-    println!("status: {}", note.frontmatter.status);
     Ok(())
 }
 

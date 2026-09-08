@@ -14,7 +14,7 @@ cargo install --path crates/engnote-cli
 
 ### シェル補完(zsh)
 
-`~/.zshrc` に1行追加すると、`show`/`edit`/`rm`/`tag`/`status` の `<ref>` をTabで補完できる(ノートのタイトル・タグが候補として出る)。
+`~/.zshrc` に1行追加すると、`show`/`edit`/`rm`/`tag` の `<ref>` をTabで補完できる(ノートのタイトル・タグが候補として出る)。
 
 ```bash
 echo 'source <(COMPLETE=zsh engnote)' >> ~/.zshrc
@@ -98,7 +98,7 @@ codesign --force --deep --sign - /Applications/engnote.app
 ## 使い方
 
 ```bash
-# クイックキャプチャ(status=draft、閉じた世界)
+# クイックキャプチャ(閉じた世界)
 engnote capture "SQLiteのインデックス設計で詰まった"
 
 # 今いるディレクトリに紐付けて保存(開いた世界)
@@ -109,7 +109,6 @@ engnote new --title "設計メモ" --tag rust --tag architecture --here
 
 # 一覧・絞り込み
 engnote list
-engnote list --status draft
 engnote list --tag rust
 engnote here                 # 今いるディレクトリに関連するノートだけ
 
@@ -118,7 +117,6 @@ engnote show [<ref>]
 engnote edit [<ref>]
 engnote tag [<ref>] add rust
 engnote tag [<ref>] rm rust
-engnote status [<ref>] active   # draft | active | archived
 engnote rm [<ref>]              # 確認あり
 ```
 
