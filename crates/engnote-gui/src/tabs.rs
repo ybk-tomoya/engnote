@@ -156,7 +156,7 @@ impl Tabs {
         self.prune_empty_groups();
     }
 
-    /// Ctrl+H / Ctrl+L: move the active tab left/right, wrapping around.
+    /// Ctrl+K / Ctrl+J: move the active tab up/down, wrapping around.
     /// Auto-expands the landing tab's group if it was collapsed, so cycling
     /// through tabs never lands somewhere invisible.
     pub fn select_relative(&mut self, delta: i32) {
@@ -332,9 +332,10 @@ fn tab_label(content: &TabContent, notes: &[(PathBuf, Note)]) -> String {
     }
 }
 
-/// Renders the browser-style tab bar (and any tab groups) across the top of
-/// the window. Read-only over `tabs`/`notes` — returns what the user clicked
-/// or dragged, if anything, for the caller to apply via `Tabs::apply`.
+/// Renders the browser-style tab list (and any tab groups) as a vertical
+/// strip down the left edge of the window (à la Arc/Dia), leftmost of all
+/// the side panels. Read-only over `tabs`/`notes` — returns what the user
+/// clicked or dragged, if anything, for the caller to apply via `Tabs::apply`.
 ///
 /// `dragging` is the id of the tab currently being click-dragged, if any; it
 /// persists across frames in the caller's state (a single mouse-down/drag
@@ -353,20 +354,31 @@ pub fn render_bar(
     let mut rects: Vec<(u64, egui::Rect)> = Vec::with_capacity(tabs.items.len());
 
     // A drag that ends anywhere outside a tab's own hit-test (e.g. released
-    // over empty space in the bar) should still stop being "in progress".
+    // over empty space in the panel) should still stop being "in progress".
     if !ctx.input(|i| i.pointer.any_down()) {
         *dragging = None;
     }
 
-    egui::TopBottomPanel::top("tabbar")
+    egui::SidePanel::left("tabbar")
+        .resizable(true)
+        .default_width(220.0)
+        .min_width(160.0)
         .frame(
             egui::Frame::new()
                 .fill(theme::PANEL_BG)
-                .inner_margin(egui::Margin::symmetric(10, 6)),
+                .inner_margin(egui::Margin::symmetric(8, 8)),
         )
         .show(ctx, |ui| {
-            egui::ScrollArea::horizontal().id_salt("tabbar-scroll").show(ui, |ui| {
-                ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(egui::RichText::new("＋ 新しいタブ").color(theme::TEXT)).frame(false))
+                .clicked()
+            {
+                action = Some(BarAction::NewTab);
+            }
+            ui.add_space(6.0);
+
+            egui::ScrollArea::vertical().id_salt("tabbar-scroll").show(ui, |ui| {
+                ui.vertical(|ui| {
                     let mut i = 0;
                     while i < tabs.items.len() {
                         match tabs.items[i].group {
@@ -389,9 +401,6 @@ pub fn render_bar(
                             }
                         }
                     }
-                    if ui.add(egui::Button::new("＋").frame(false)).clicked() {
-                        action = Some(BarAction::NewTab);
-                    }
                 });
             });
         });
@@ -400,14 +409,15 @@ pub fn render_bar(
     // tab's rect (not from inside each tab's own render call): step the
     // dragged tab exactly one slot toward wherever the pointer currently is,
     // gated by whether the pointer has crossed the midpoint of that one
-    // adjacent slot. An earlier version jumped straight to whichever tab's
-    // rect contained the pointer; since every swap changes tab widths
-    // (labels differ in length) and thus shifts rect boundaries, that could
-    // immediately re-trigger another jump next frame — a feedback loop that
-    // raced the tab across the whole bar. Stepping one slot at a time and
-    // gating on a midpoint crossing has no such loop: it settles as soon as
-    // the pointer stops crossing a boundary, and a fast/far drag still gets
-    // there quickly by repeating this once per frame while held.
+    // adjacent slot (vertically, since tabs stack top-to-bottom here). An
+    // earlier version jumped straight to whichever tab's rect contained the
+    // pointer; since every swap changes tab heights (grouped rows, wrapped
+    // long titles) and thus shifts rect boundaries, that could immediately
+    // re-trigger another jump next frame — a feedback loop that raced the
+    // tab up/down the list. Stepping one slot at a time and gating on a
+    // midpoint crossing has no such loop: it settles as soon as the pointer
+    // stops crossing a boundary, and a fast/far drag still gets there
+    // quickly by repeating this once per frame while held.
     if let Some(dragged_id) = *dragging {
         if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
             if let Some(from) = tabs.items.iter().position(|t| t.id == dragged_id) {
@@ -417,8 +427,8 @@ pub fn render_bar(
                             let step: i32 = if to > from { 1 } else { -1 };
                             let next = (from as i32 + step) as usize;
                             if let Some(&(_, next_rect)) = rects.get(next) {
-                                let mid = next_rect.center().x;
-                                let crossed = if step > 0 { pointer.x > mid } else { pointer.x < mid };
+                                let mid = next_rect.center().y;
+                                let crossed = if step > 0 { pointer.y > mid } else { pointer.y < mid };
                                 if crossed {
                                     action = Some(BarAction::MoveTab { from, to: next });
                                 }
@@ -466,8 +476,9 @@ fn render_tab(
         .fill(bg)
         .stroke(egui::Stroke::new(1.0, border))
         .corner_radius(egui::CornerRadius::same(6))
-        .inner_margin(egui::Margin::symmetric(8, 4))
+        .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 let text_resp = ui.add(
                     egui::Label::new(egui::RichText::new(&label).color(theme::TEXT)).selectable(false),
@@ -475,23 +486,33 @@ fn render_tab(
                 text_rect = text_resp.rect;
 
                 if can_close {
-                    let close_resp = ui.add(
-                        egui::Label::new(egui::RichText::new("×").color(theme::TEXT_DIM))
-                            .sense(egui::Sense::click()),
-                    );
-                    if close_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    close_clicked = close_resp.clicked();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let close_resp = ui.add(
+                            egui::Label::new(egui::RichText::new("×").color(theme::TEXT_DIM))
+                                .sense(egui::Sense::click()),
+                        );
+                        if close_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        close_clicked = close_resp.clicked();
+                        // The label above already claimed the rest of the row via
+                        // `text_resp.rect`; extend it to the close button's left
+                        // edge so the drag/click hit-test below covers the whole
+                        // row (not just the label glyphs themselves), without
+                        // overlapping the close button.
+                        text_rect.set_right(ui.min_rect().left());
+                    });
+                } else {
+                    text_rect.set_right(ui.max_rect().right());
                 }
             });
         });
 
-    // Interact over just the label's rect (not the close button's, which sits
-    // right next to it with no overlap) using an id keyed by the tab's own
-    // stable id rather than its position — a plain `Sense`-on-`Label` here
-    // would get an auto id derived from tree position, which changes when we
-    // reorder tabs mid-drag and would silently drop the in-progress drag.
+    // Interact over the row minus the close button (which sits to its right
+    // with no overlap) using an id keyed by the tab's own stable id rather
+    // than its position — a plain `Sense`-on-`Label` here would get an auto
+    // id derived from tree position, which changes when we reorder tabs
+    // mid-drag and would silently drop the in-progress drag.
     let drag_id = egui::Id::new("engnote-tab-drag").with(tab.id);
     let drag_resp = ui.interact(text_rect, drag_id, egui::Sense::click_and_drag());
     rects.push((tab.id, drag_resp.rect));
@@ -519,6 +540,8 @@ fn render_tab(
         }
     });
 
+    ui.add_space(4.0);
+
     action
 }
 
@@ -543,9 +566,10 @@ fn render_group(
         .fill(color.gamma_multiply(0.14))
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.6)))
         .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::symmetric(6, 3))
+        .inner_margin(egui::Margin::symmetric(6, 6))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.set_width(ui.available_width());
+            ui.vertical(|ui| {
                 let arrow = if collapsed { "▸" } else { "▾" };
                 let label = if name.is_empty() {
                     format!("{arrow} タブグループ ({member_count})")
@@ -569,6 +593,7 @@ fn render_group(
                 });
 
                 if !collapsed {
+                    ui.add_space(4.0);
                     for idx in start..end {
                         if let Some(a) = render_tab(ui, tabs, notes, idx, dragging, rects) {
                             action = Some(a);
@@ -577,6 +602,7 @@ fn render_group(
                 }
             });
         });
+    ui.add_space(4.0);
 
     action
 }

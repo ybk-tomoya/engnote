@@ -399,10 +399,12 @@ impl App {
     }
 
     /// App-wide vim-style keyboard shortcuts, plus the browser-style tab
-    /// shortcuts (Ctrl+H/L, Cmd+P/T/W). The tab shortcuts are checked first
-    /// and consumed via `consume_key` so they win regardless of which text
-    /// field currently has focus — same idea as the existing Cmd+S save
-    /// shortcut in `handle_editing_keys`.
+    /// shortcuts (Ctrl+K/J, Cmd+P/T/W). Ctrl+K/J (not H/L) since the tab list
+    /// is a vertical strip (see `tabs::render_bar`) — K/J mirrors vim's
+    /// up/down, matching the tabs' actual layout instead of vim's left/right.
+    /// The tab shortcuts are checked first and consumed via `consume_key` so
+    /// they win regardless of which text field currently has focus — same
+    /// idea as the existing Cmd+S save shortcut in `handle_editing_keys`.
     fn handle_global_keys(&mut self, ctx: &egui::Context) {
         if self.quick_open.is_some() {
             // Its own key handling (arrows/Enter/Esc) happens in
@@ -423,11 +425,11 @@ impl App {
             self.tabs.close(idx);
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::H)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::K)) {
             self.tabs.select_relative(-1);
             return;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::L)) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::J)) {
             self.tabs.select_relative(1);
             return;
         }
@@ -938,7 +940,7 @@ impl eframe::App for App {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド ・ ⌃H/⌃L タブ移動 ・ ⌘P 開く ・ ⌘T 新規タブ",
+                            "j/k 移動 ・ n 新規 ・ e 編集 ・ / 検索 ・ : コマンド ・ ⌃K/⌃J タブ移動 ・ ⌘P 開く ・ ⌘T 新規タブ",
                         )
                         .small()
                         .color(theme::TEXT_DIM),
