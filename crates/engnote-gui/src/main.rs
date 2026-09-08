@@ -460,6 +460,14 @@ impl App {
         if let Mode::Editing(form) = &mut self.mode {
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
                 intent = Intent::Save;
+            } else if form.active_field == ActiveField::Body
+                && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V))
+            {
+                // Peek only (don't consume): TextEdit's own paste reacts to
+                // `Event::Paste`, not this raw key, so a plain-text paste is
+                // unaffected either way — we only act when the clipboard
+                // actually holds an image.
+                paste_clipboard_image(ctx, form, &self.vault_dir);
             } else if form.editor_mode == vim::EditorMode::Insert {
                 if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
                     let field_id = form.active_field.id();
@@ -550,6 +558,93 @@ fn consume_text_event(ctx: &egui::Context, target: char) -> bool {
     })
 }
 
+/// If the OS clipboard holds an image, saves it under `<vault>/assets/` and
+/// inserts a Markdown image link at the cursor in `form.body` — at the live
+/// `TextEdit`'s cursor in Insert mode, or `form.cursor` in Normal mode. A
+/// no-op if the clipboard has no image (e.g. it's plain text).
+fn paste_clipboard_image(ctx: &egui::Context, form: &mut EditForm, vault_dir: &std::path::Path) {
+    let Some(snippet) = save_clipboard_image(vault_dir) else {
+        return;
+    };
+
+    match form.editor_mode {
+        vim::EditorMode::Insert => {
+            let field_id = form.active_field.id();
+            let mut cursor = form.body.chars().count();
+            let state = egui::text_edit::TextEditState::load(ctx, field_id);
+            if let Some(range) = state.as_ref().and_then(|s| s.cursor.char_range()) {
+                cursor = range.primary.index.min(form.body.chars().count());
+            }
+            form.body.insert_str(char_byte_index(&form.body, cursor), &snippet);
+            let new_cursor = cursor + snippet.chars().count();
+            let mut state = state.unwrap_or_default();
+            state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(new_cursor))));
+            state.store(ctx, field_id);
+        }
+        vim::EditorMode::Normal => {
+            form.body.insert_str(char_byte_index(&form.body, form.cursor), &snippet);
+            form.cursor += snippet.chars().count();
+        }
+    }
+}
+
+/// Byte offset of the `char_idx`-th character in `s` (or `s.len()` if
+/// `char_idx` is at or past the end) — `String::insert_str` needs a byte
+/// index, but our cursors are character indices (see `EditForm::cursor`).
+fn char_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices().nth(char_idx).map_or(s.len(), |(b, _)| b)
+}
+
+/// Saves the clipboard's image (if any) as a PNG under `<vault>/assets/` and
+/// returns a Markdown snippet linking it. `None` if the clipboard has no
+/// image or saving failed.
+fn save_clipboard_image(vault_dir: &std::path::Path) -> Option<String> {
+    let assets_dir = vault_dir.join("assets");
+    std::fs::create_dir_all(&assets_dir).ok()?;
+
+    let filename = format!("{}.png", ulid::Ulid::generate());
+    let path = assets_dir.join(&filename);
+    write_clipboard_image_as_png(&path)?;
+
+    Some(format!("![](assets/{filename})"))
+}
+
+/// Writes whatever image is on the OS clipboard to `path` as PNG.
+///
+/// On macOS this reads `NSPasteboardTypePNG` bytes straight off the
+/// pasteboard and writes them as-is (no re-encoding) — deliberately *not*
+/// going through `arboard::Clipboard::get_image()`, which on macOS only
+/// requests the TIFF representation and decodes it with `image`'s TIFF
+/// decoder; that decoder can't handle the TIFF macOS synthesizes from a
+/// PNG-originated clipboard image (`Error::ConversionFailure`), even though
+/// a `public.png` representation was on the pasteboard the whole time.
+#[cfg(target_os = "macos")]
+fn write_clipboard_image_as_png(path: &std::path::Path) -> Option<()> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+
+    let bytes = unsafe {
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.dataForType(NSPasteboardTypePNG)
+    }?
+    .to_vec();
+
+    std::fs::write(path, bytes).ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_clipboard_image_as_png(path: &std::path::Path) -> Option<()> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let image_data = clipboard.get_image().ok()?;
+    image::save_buffer(
+        path,
+        &image_data.bytes,
+        image_data.width as u32,
+        image_data.height as u32,
+        image::ColorType::Rgba8,
+    )
+    .ok()
+}
+
 enum GuiAction {
     StartNew,
     StartEdit(EditForm),
@@ -557,6 +652,11 @@ enum GuiAction {
     Cancel,
     /// Jump to another note by index (clicking an outgoing link/backlink).
     SelectNote(usize),
+    /// Flip a `[ ]`/`[x]` task checkbox clicked in the body view and persist it.
+    ToggleCheckbox {
+        index: usize,
+        marker_range: std::ops::Range<usize>,
+    },
 }
 
 /// Renders one note as a clickable card and returns its (post-hoc clickable) response.
@@ -906,17 +1006,22 @@ impl eframe::App for App {
                                         .inner_margin(egui::Margin::same(18))
                                         .show(ui, |ui| {
                                             ui.set_width(ui.available_width());
-                                            markdown::render(
+                                            let toggled = markdown::render_interactive(
                                                 ui,
                                                 &note.body,
                                                 &markdown::Palette {
                                                     text: theme::TEXT,
                                                     dim: theme::TEXT_DIM,
                                                     strong: egui::Color32::WHITE,
-                                                    accent: theme::ACCENT,
                                                     code_bg: theme::BG,
                                                 },
                                             );
+                                            if let Some(marker_range) = toggled {
+                                                action = Some(GuiAction::ToggleCheckbox {
+                                                    index: i,
+                                                    marker_range,
+                                                });
+                                            }
                                         });
 
                                     if !outgoing.is_empty() {
@@ -1121,7 +1226,59 @@ impl eframe::App for App {
                 self.selected = Some(i);
                 self.mode = Mode::Viewing;
             }
+            Some(GuiAction::ToggleCheckbox { index, marker_range }) => {
+                let (path, note) = &self.notes[index];
+                let mid = marker_range.start + 1;
+                let mut new_body = note.body.clone();
+                let is_unchecked = new_body.as_bytes().get(mid) == Some(&b' ');
+                new_body.replace_range(mid..mid + 1, if is_unchecked { "x" } else { " " });
+                let mut updated = note.clone();
+                updated.body = new_body;
+                updated.frontmatter.updated = Local::now();
+                match vault::save_at(path, &updated) {
+                    Ok(()) => {
+                        let id = updated.frontmatter.id.clone();
+                        self.reload();
+                        self.select_by_id(&id);
+                    }
+                    Err(e) => self.error = Some(format!("チェック状態の保存に失敗: {e:#}")),
+                }
+            }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Manual check, not run by `cargo test` by default: copy an image
+    /// (e.g. a screenshot) to the clipboard first, then
+    /// `cargo test -p engnote-gui save_clipboard_image_writes_a_real_png -- --ignored`.
+    #[test]
+    #[ignore = "manual: requires a real image on the OS clipboard"]
+    fn save_clipboard_image_writes_a_real_png() {
+        let dir = std::env::temp_dir().join("engnote-clip-probe");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let snippet = save_clipboard_image(&dir).expect("expected an image on the clipboard");
+        let filename = snippet
+            .strip_prefix("![](assets/")
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("snippet should be `![](assets/<file>.png)`");
+
+        let bytes = std::fs::read(dir.join("assets").join(filename)).expect("saved file should be readable");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "saved file should be a real PNG");
+    }
+
+    #[test]
+    fn char_byte_index_handles_multibyte_chars() {
+        let s = "aあb";
+        assert_eq!(char_byte_index(s, 0), 0);
+        assert_eq!(char_byte_index(s, 1), 1); // right after 'a'
+        assert_eq!(char_byte_index(s, 2), 1 + "あ".len()); // right after 'あ' (3 bytes)
+        assert_eq!(char_byte_index(s, 3), s.len()); // at end
+        assert_eq!(char_byte_index(s, 99), s.len()); // past end clamps
     }
 }
